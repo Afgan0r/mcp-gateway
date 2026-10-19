@@ -11,8 +11,6 @@ RUN apt-get update && apt-get install -y curl gnupg git build-essential procps \
   && apt-get install -y nodejs \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN corepack enable && corepack prepare pnpm@10.12.4 --activate
-
 ENV RUSTUP_HOME=/usr/local/rustup \
   CARGO_HOME=/usr/local/cargo \
   PATH=/usr/local/cargo/bin:$PATH
@@ -43,7 +41,8 @@ RUN uv tool install mcp-server-fetch
 
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml .pnpmfile.cjs ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs ./
+RUN corepack enable && corepack install && pnpm --version
 COPY patches ./patches
 RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
   pnpm config set store-dir /pnpm/store && pnpm fetch --frozen-lockfile

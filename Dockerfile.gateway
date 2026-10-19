@@ -2,8 +2,8 @@
 
 FROM node:24.16.0-bookworm-slim AS manifests
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@10.12.4 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs ./
+RUN corepack enable && corepack install && pnpm --version
 COPY patches ./patches
 
 FROM manifests AS dependencies

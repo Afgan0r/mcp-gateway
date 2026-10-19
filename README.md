@@ -56,7 +56,7 @@ It works with MCP clients such as Claude Code, Cursor, Cherry Studio, OpenWebUI,
 ### Prerequisites
 
 - **Docker** (recommended) — the fastest way to run MCPHub; all commands below use it
-- **Node.js** `>=20.0.0` and **pnpm** `10.12.4` — only needed to run from source or develop locally (see [Local Development](#local-development))
+- **Node.js** `>=20.0.0` and **pnpm** `12.14.0` — only needed to run from source or develop locally (see [Local Development](#local-development))
 
 ### Start with Docker
 
@@ -135,16 +135,16 @@ Set `SMART_ROUTING_PATH=my_smart` to use `/mcp/my_smart` (and `/mcp/my_smart/{gr
 
 ## 📚 Documentation
 
-| Topic                                                                          | Description                       |
+| Topic | Description |
 | ------------------------------------------------------------------------------ | --------------------------------- |
-| [Quick Start](https://docs.mcphub.app/quickstart)                             | Get started in 5 minutes          |
-| [Configuration](https://docs.mcphub.app/configuration/mcp-settings)           | MCP server configuration options  |
-| [Database Mode](https://docs.mcphub.app/configuration/database-configuration) | PostgreSQL setup for production   |
-| [OAuth](https://docs.mcphub.app/features/oauth)                               | OAuth 2.0 client and server setup |
-| [Smart Routing](https://docs.mcphub.app/features/smart-routing)               | AI-powered tool discovery         |
-| [MCP Apps](https://docs.mcphub.app/features/mcp-apps)                         | Interactive Apps transparent proxy |
-| [CLI Guide](https://docs.mcphub.app/features/cli)                             | Manage and call the hub from a terminal |
-| [Docker Setup](https://docs.mcphub.app/configuration/docker-setup)            | Docker deployment guide           |
+| [Quick Start](https://docs.mcphub.app/quickstart) | Get started in 5 minutes |
+| [Configuration](https://docs.mcphub.app/configuration/mcp-settings) | MCP server configuration options |
+| [Database Mode](https://docs.mcphub.app/configuration/database-configuration) | PostgreSQL setup for production |
+| [OAuth](https://docs.mcphub.app/features/oauth) | OAuth 2.0 client and server setup |
+| [Smart Routing](https://docs.mcphub.app/features/smart-routing) | AI-powered tool discovery |
+| [MCP Apps](https://docs.mcphub.app/features/mcp-apps) | Interactive Apps transparent proxy |
+| [CLI Guide](https://docs.mcphub.app/features/cli) | Manage and call the hub from a terminal |
+| [Docker Setup](https://docs.mcphub.app/configuration/docker-setup) | Docker deployment guide |
 
 ## 🧑‍💻 Local Development
 
