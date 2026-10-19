@@ -11,6 +11,14 @@ const mockClientClose = jest.fn();
 const mockListTools = jest.fn().mockResolvedValue({ tools: [] });
 
 const mockStdioTransportClose = jest.fn();
+let mockBridgedTransports = new WeakSet<object>();
+jest.mock('../../src/utils/hostBridgeTransport.js', () => ({
+  ...jest.requireActual('../../src/utils/hostBridgeTransport.js'),
+  isHostBridgeTransport: (transport: object) => mockBridgedTransports.has(transport),
+}));
+jest.mock('../../src/utils/stdioProcessCleanup.js', () => ({
+  closeTrackedStdioProcessTree: jest.fn(async (_pid: number, close: () => Promise<void>) => close()),
+}));
 
 // Per-instance PID. The mock factory stores a fresh instance in this map so
 // tests can look up / set PIDs from the outside.
@@ -164,11 +172,15 @@ const installProcessKillMock = (): void => {
 // Import after mocks
 import {
   addServer,
+  closeServer,
+  cleanupAllServers,
+  reconnectServer,
   removeServer,
   setServerInfosForTest,
   toggleServerStatus,
 } from '../../src/services/mcpService.js';
 import type { ServerInfo } from '../../src/types/index.js';
+import { logger } from '../../src/utils/logger.js';
 const makeStdioServerInfo = (name: string): ServerInfo =>
   ({
     name,
@@ -186,6 +198,7 @@ const makeStdioServerInfo = (name: string): ServerInfo =>
 describe('orphan stdio process cleanup (issue #920)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockBridgedTransports = new WeakSet<object>();
     currentTestPid = 12345;
     mockProcessTreeKillAvailability.value = true;
     setServerInfosForTest([]);
@@ -335,6 +348,69 @@ describe('orphan stdio process cleanup (issue #920)', () => {
         jest.useRealTimers();
       }
     });
+  });
+
+  it('consumes rejected client and transport shutdown promises', async () => {
+    const warning = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const info = makeStdioServerInfo('rejected-close');
+    setServerInfosForTest([info]);
+    mockClientClose.mockRejectedValueOnce(new Error('client close failed'));
+    mockStdioTransportClose.mockRejectedValueOnce(new Error('transport close failed'));
+    closeServer(info.name);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(warning).toHaveBeenCalledWith('Error closing MCP client during runtime shutdown');
+    expect(warning).toHaveBeenCalledWith('Error closing MCP transport during runtime shutdown');
+    expect(info.client).toBeUndefined();
+    expect(info.transport).toBeUndefined();
+  });
+
+  it('keeps a failed bridge shutdown retryable without signalling its relay early', async () => {
+    const warning = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const info = makeStdioServerInfo('bridge-close-failed');
+    const originalTransport = info.transport;
+    mockBridgedTransports.add(originalTransport!);
+    setServerInfosForTest([info]);
+    mockStdioTransportClose.mockRejectedValueOnce(new Error('Host MCP cleanup was not verified'));
+    closeServer(info.name);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(warning).toHaveBeenCalledWith('Host MCP cleanup was not verified during runtime shutdown');
+    expect(mockTreeKill).not.toHaveBeenCalled();
+    expect(mockClientClose).not.toHaveBeenCalled();
+    expect(info.transport).toBe(originalTransport);
+    expect(info.client).toBeDefined();
+    await cleanupAllServers();
+    expect(info.transport).toBeUndefined();
+    expect(info.client).toBeUndefined();
+  });
+
+  it('awaits bridge acknowledgement during global shutdown before clearing runtime references', async () => {
+    const info = makeStdioServerInfo('bridge-close-pending');
+    mockBridgedTransports.add(info.transport!);
+    setServerInfosForTest([info]);
+    let acknowledge!: () => void;
+    mockStdioTransportClose.mockImplementationOnce(() => new Promise<void>((resolve) => { acknowledge = resolve; }));
+    let finished = false;
+    const closing = cleanupAllServers().then(() => { finished = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(finished).toBe(false);
+    expect(mockTreeKill).not.toHaveBeenCalled();
+    expect(mockClientClose).not.toHaveBeenCalled();
+    expect(info.transport).toBeDefined();
+    acknowledge();
+    await closing;
+    expect(info.transport).toBeUndefined();
+    expect(info.client).toBeUndefined();
+  });
+
+  it('propagates an unverified bridge close to an explicit reconnect caller', async () => {
+    const info = makeStdioServerInfo('bridge-reconnect-failed');
+    mockBridgedTransports.add(info.transport!);
+    setServerInfosForTest([info]);
+    mockServerDao.findById.mockResolvedValueOnce({ enabled: true });
+    mockStdioTransportClose.mockRejectedValueOnce(new Error('Host MCP cleanup was not verified'));
+    await expect(reconnectServer(info.name)).rejects.toThrow('Host MCP cleanup was not verified');
+    expect(info.transport).toBeDefined();
+    expect(mockTreeKill).not.toHaveBeenCalled();
   });
 
   describe('toggleServerStatus (disable)', () => {

@@ -181,6 +181,7 @@ jest.mock('../../src/config/index.js', () => ({
 }));
 
 import * as mcpService from '../../src/services/mcpService.js';
+import * as hostBridge from '../../src/utils/hostBridgeTransport.js';
 import { RequestContextService } from '../../src/services/requestContextService.js';
 
 const stateHandle = '65b523af-e4d0-4d99-8e06-461a62a14967';
@@ -429,6 +430,17 @@ describe('opt-in retained runtime integration', () => {
       (item) => item instanceof MockStdioClientTransport,
     );
     transport.close.mockRejectedValueOnce(new Error('transport close failed'));
+    expect(payload(await control('mcphub_runtime_release'))[0].status).toBe('close_failed');
+    expect(payload(await control('mcphub_runtime_list'))[0].status).toBe('close_failed');
+    expect((await invoke()).isError).toBe(true);
+    expect(payload(await control('mcphub_runtime_release'))[0].status).toBe('released');
+  });
+
+  test('preserves close_failed when the host bridge cannot verify owned cleanup', async () => {
+    await invoke();
+    const transport = mockCreatedTransports.find((item) => item instanceof MockStdioClientTransport);
+    jest.spyOn(hostBridge, 'isHostBridgeTransport').mockImplementation((item) => item === transport);
+    transport.close.mockRejectedValueOnce(new Error('Host MCP cleanup was not verified'));
     expect(payload(await control('mcphub_runtime_release'))[0].status).toBe('close_failed');
     expect(payload(await control('mcphub_runtime_list'))[0].status).toBe('close_failed');
     expect((await invoke()).isError).toBe(true);

@@ -166,6 +166,9 @@ jest.mock('../../src/config/index.js', () => ({
 }));
 
 import * as mcpService from '../../src/services/mcpService.js';
+import * as hostBridge from '../../src/utils/hostBridgeTransport.js';
+import * as stdioCleanup from '../../src/utils/stdioProcessCleanup.js';
+import { logger } from '../../src/utils/logger.js';
 import { RequestContextService } from '../../src/services/requestContextService.js';
 
 const stateHandle = '65b523af-e4d0-4d99-8e06-461a62a14967';
@@ -539,6 +542,40 @@ describe('mcpService per-session client isolation (perSessionClient)', () => {
 
     // The process-tree helper (tree-kill) must be used, not a bare SIGTERM.
     expect(mockTreeKill).toHaveBeenCalledWith(4242, 'SIGTERM', expect.any(Function));
+  });
+
+  it('handles a rejected isolated bridge close without signalling the relay or an unhandled rejection', async () => {
+    const serverInfo = makeServerInfo({
+      type: 'stdio',
+      url: undefined,
+      command: 'node',
+      perSessionClient: true,
+    });
+    mcpService.setServerInfosForTest([serverInfo]);
+    await callTool('session-A');
+    const transport = mockCreatedTransports.find(
+      (item) => item instanceof MockStdioClientTransport,
+    );
+    jest
+      .spyOn(hostBridge, 'isHostBridgeTransport')
+      .mockImplementation((item) => item === transport);
+    const warning = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    transport.close.mockRejectedValueOnce(new Error('Host MCP cleanup was not verified'));
+    mcpService.deleteMcpServer('session-A');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(warning).toHaveBeenCalledWith(
+      '[iso-server] Host MCP cleanup was not verified for isolated client',
+    );
+    expect(mockTreeKill).not.toHaveBeenCalled();
+    expect(mockCreatedClients[0].close).not.toHaveBeenCalled();
+    jest
+      .spyOn(stdioCleanup, 'closeTrackedStdioProcessTree')
+      .mockImplementation(async (_pid, close) => {
+        await close();
+      });
+    await mcpService.cleanupAllServers();
+    expect(mockCreatedClients[0].close).toHaveBeenCalledTimes(1);
+    expect(transport.close).toHaveBeenCalledTimes(3);
   });
 
   it('closes the client and kills the stdio process tree when the isolated connect fails', async () => {

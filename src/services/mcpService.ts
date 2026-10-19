@@ -460,41 +460,73 @@ export const deleteMcpServer = (sessionId: string): void => {
   cleanupIsolatedSession(sessionId);
 };
 
-/**
- * Close an isolated upstream client and its transport, killing the whole stdio
- * process tree (to avoid orphaned wrappers like `npx`) when applicable.
- */
-const closeIsolatedClient = (serverName: string, client: Client, transport: any): void => {
+const closeWithWarning = (
+  operation: () => Promise<void> | void,
+  warning: string,
+): Promise<void> => {
   try {
-    client.close();
-  } catch (e) {
-    logger.warn(`[${serverName}] Error closing isolated client:`, e);
+    return Promise.resolve(operation()).catch(() => logger.warn(warning));
+  } catch {
+    logger.warn(warning);
+    return Promise.resolve();
   }
+};
+
+const pendingIsolatedBridgeCloses = new Map<Transport, () => Promise<void>>();
+
+/** Close an isolated upstream without losing rejected asynchronous cleanup. */
+const closeIsolatedClient = (serverName: string, client: Client, transport: any): Promise<void> => {
+  if (isHostBridgeTransport(transport)) {
+    const pending = pendingIsolatedBridgeCloses.get(transport);
+    if (pending) return pending();
+    let closing: Promise<void> | undefined;
+    const retry = (): Promise<void> => {
+      closing ??= closeOwnedIsolatedClient(serverName, client, transport)
+        .then(() => {
+          pendingIsolatedBridgeCloses.delete(transport);
+        })
+        .catch(() => {
+          logger.warn(`[${serverName}] Host MCP cleanup was not verified for isolated client`);
+        })
+        .finally(() => {
+          closing = undefined;
+        });
+      return closing;
+    };
+    pendingIsolatedBridgeCloses.set(transport, retry);
+    return retry();
+  }
+
+  const clientClose = closeWithWarning(
+    () => client.close(),
+    `[${serverName}] Error closing isolated client`,
+  );
 
   const candidateTransport = transport as { pid?: unknown };
   const stdioPid = typeof candidateTransport.pid === 'number' ? candidateTransport.pid : null;
 
-  try {
-    transport.close();
-  } catch (e) {
-    logger.warn(`[${serverName}] Error closing isolated transport:`, e);
-  }
+  const transportClose = closeWithWarning(
+    () => transport.close(),
+    `[${serverName}] Error closing isolated transport`,
+  );
 
   // For stdio transports, kill the whole process tree to avoid orphans
   if (stdioPid) {
     killStdioProcessTree(serverName, stdioPid);
   }
+  return Promise.all([clientClose, transportClose]).then(() => undefined);
 };
 
 /**
  * Clean up per-session isolated upstream clients for a given session.
  * Closes all clients and transports, then removes the session entry.
  */
-const cleanupIsolatedSession = (sessionId: string): void => {
+const cleanupIsolatedSession = (sessionId: string): Promise<void> => {
+  const closing: Promise<void>[] = [];
   const sessionClients = sessionIsolatedClients.get(sessionId);
   if (sessionClients) {
     for (const [serverName, { client, transport }] of sessionClients) {
-      closeIsolatedClient(serverName, client, transport);
+      closing.push(closeIsolatedClient(serverName, client, transport));
     }
 
     sessionIsolatedClients.delete(sessionId);
@@ -505,14 +537,14 @@ const cleanupIsolatedSession = (sessionId: string): void => {
         isolatedClientCreationLocks.delete(key);
       }
     }
-    logger.log(`Cleaned up isolated clients for session: ${sessionId}`);
+    logger.log(`Closing isolated clients for session: ${sessionId}`);
   }
-
   // Drop per-session OpenAPI cookie jars so authenticated state does not
   // outlive the downstream session.
   for (const serverInfo of serverInfos) {
     serverInfo.openApiClient?.clearSessionCookies?.(sessionId);
   }
+  return Promise.all(closing).then(() => undefined);
 };
 
 /** Helper to write an isolated session upstream client into the tracking map. */
@@ -585,7 +617,7 @@ const getOrCreateIsolatedClient = async (
       // process tree so a failed handshake doesn't leak resources.
       if (sessionId.startsWith('runtime-owner:'))
         await closeOwnedIsolatedClient(serverInfo.name, client, transport);
-      else closeIsolatedClient(serverInfo.name, client, transport);
+      else await closeIsolatedClient(serverInfo.name, client, transport);
       throw connectError;
     }
 
@@ -597,7 +629,7 @@ const getOrCreateIsolatedClient = async (
       );
       if (sessionId.startsWith('runtime-owner:'))
         await closeOwnedIsolatedClient(serverInfo.name, client, transport);
-      else closeIsolatedClient(serverInfo.name, client, transport);
+      else await closeIsolatedClient(serverInfo.name, client, transport);
       throw new Error(`Session ${sessionId} no longer exists`);
     }
 
@@ -1167,7 +1199,7 @@ const ownedStateId = (ownerId: string): string => `runtime-owner:${ownerId}`;
 
 const closeOwnedIsolatedClient = async (
   serverName: string,
-  client: Client,
+  client: Client | undefined,
   transport: Transport,
 ): Promise<void> => {
   const pid = (transport as Transport & { pid?: number }).pid;
@@ -1176,7 +1208,7 @@ const closeOwnedIsolatedClient = async (
   if (isHostBridgeTransport(transport)) await transport.close();
   const close = async () => {
     const results = await Promise.allSettled([
-      Promise.resolve().then(() => client.close()),
+      Promise.resolve().then(() => client?.close()),
       Promise.resolve().then(() => transport.close?.()),
     ]);
     const failed = results.find((result) => result.status === 'rejected');
@@ -1611,22 +1643,26 @@ export const cleanupAllServers = async (): Promise<void> => {
   for (const id of clientStates.keys()) removeClientState(id);
   principalRuntimes.invalidate();
   const ownerCleanup = runtimeOwners.invalidate();
+  const pendingIsolatedCleanup = [...pendingIsolatedBridgeCloses.values()].map((retry) => retry());
   retentionConfigurations.clear();
-  for (const serverInfo of serverInfos) {
-    closeServerRuntime(serverInfo);
-  }
+  const runtimeCleanup = serverInfos.map((serverInfo) => closeServerRuntime(serverInfo));
   serverInfos = [];
 
   // Drain all per-session isolated upstream clients (perSessionClient: true),
-  for (const sessionId of [...sessionIsolatedClients.keys()]) {
-    if (!sessionId.startsWith('runtime-owner:')) cleanupIsolatedSession(sessionId);
-  }
+  const isolatedCleanup = [...sessionIsolatedClients.keys()]
+    .filter((sessionId) => !sessionId.startsWith('runtime-owner:'))
+    .map((sessionId) => cleanupIsolatedSession(sessionId));
 
   // Clear session servers as well
   Object.keys(servers).forEach((sessionId) => {
     delete servers[sessionId];
   });
-  await ownerCleanup;
+  await Promise.all([
+    ownerCleanup,
+    ...runtimeCleanup,
+    ...isolatedCleanup,
+    ...pendingIsolatedCleanup,
+  ]);
 };
 
 const headerValueToString = (value: string | string[] | undefined): string | undefined => {
@@ -2188,12 +2224,12 @@ const callToolWithReconnect = async (
             // replace its entry in the per-session map. Never touch the shared
             // serverInfo client/transport.
             try {
-              client.close();
+              await client.close();
             } catch {
               /* empty */
             }
             try {
-              transport.close();
+              await transport.close();
             } catch {
               /* empty */
             }
@@ -2206,12 +2242,12 @@ const callToolWithReconnect = async (
               serverInfo.keepAliveIntervalId = undefined;
             }
             try {
-              serverInfo.client?.close();
+              await serverInfo.client?.close();
             } catch {
               /* empty */
             }
             try {
-              transport.close();
+              await transport.close();
             } catch {
               /* empty */
             }
@@ -3199,19 +3235,23 @@ export const reconnectServer = async (serverName: string): Promise<void> => {
   }
 
   // Close existing connection if any
-  if (serverInfo.client) {
-    try {
-      serverInfo.client.close();
-    } catch (error) {
-      logger.warn('Error closing client for server', { serverName, error });
+  if (serverInfo.transport && isHostBridgeTransport(serverInfo.transport)) {
+    await closeOwnedIsolatedClient(serverName, serverInfo.client, serverInfo.transport);
+  } else {
+    if (serverInfo.client) {
+      try {
+        await serverInfo.client.close();
+      } catch (error) {
+        logger.warn('Error closing client for server', { serverName, error });
+      }
     }
-  }
 
-  if (serverInfo.transport) {
-    try {
-      serverInfo.transport.close();
-    } catch (error) {
-      logger.warn('Error closing transport for server', { serverName, error });
+    if (serverInfo.transport) {
+      try {
+        await serverInfo.transport.close();
+      } catch (error) {
+        logger.warn('Error closing transport for server', { serverName, error });
+      }
     }
   }
 
@@ -3524,12 +3564,28 @@ const clearIdleShutdown = (serverInfo: ServerInfo): void => {
   }
 };
 
-const closeServerRuntime = (serverInfo: ServerInfo): void => {
+const closeServerRuntime = (serverInfo: ServerInfo): Promise<void> => {
   clearIdleShutdown(serverInfo);
   if (serverInfo.keepAliveIntervalId) {
     clearInterval(serverInfo.keepAliveIntervalId);
     serverInfo.keepAliveIntervalId = undefined;
     logger.log('Cleared MCP server keep-alive interval');
+  }
+
+  const client = serverInfo.client;
+  const transport = serverInfo.transport;
+  if (transport && isHostBridgeTransport(transport)) {
+    return closeOwnedIsolatedClient(serverInfo.name, client, transport)
+      .then(() => {
+        if (serverInfo.client === client) serverInfo.client = undefined;
+        if (serverInfo.transport === transport) serverInfo.transport = undefined;
+        logger.log('Closed MCP server client and transport');
+      })
+      .catch(() => {
+        // Synchronous lifecycle callers cannot await a rejection. Keep the
+        // runtime references available for retry and consume it explicitly.
+        logger.warn('Host MCP cleanup was not verified during runtime shutdown');
+      });
   }
 
   const candidateTransport = serverInfo.transport as
@@ -3539,21 +3595,21 @@ const closeServerRuntime = (serverInfo: ServerInfo): void => {
     | undefined;
   const stdioPid = typeof candidateTransport?.pid === 'number' ? candidateTransport.pid : null;
 
-  if (serverInfo.client) {
-    try {
-      serverInfo.client.close();
-    } catch {
-      logger.warn('Error closing MCP client during runtime shutdown');
-    }
+  const closing: Promise<void>[] = [];
+  if (client) {
+    closing.push(
+      closeWithWarning(() => client.close(), 'Error closing MCP client during runtime shutdown'),
+    );
     serverInfo.client = undefined;
   }
 
-  if (serverInfo.transport) {
-    try {
-      serverInfo.transport.close();
-    } catch {
-      logger.warn('Error closing MCP transport during runtime shutdown');
-    }
+  if (transport) {
+    closing.push(
+      closeWithWarning(
+        () => transport.close(),
+        'Error closing MCP transport during runtime shutdown',
+      ),
+    );
     serverInfo.transport = undefined;
   }
 
@@ -3562,6 +3618,7 @@ const closeServerRuntime = (serverInfo: ServerInfo): void => {
   }
 
   logger.log('Closed MCP server client and transport');
+  return Promise.all(closing).then(() => undefined);
 };
 
 // Close server client and transport (keeps the entry in serverInfos; the next
