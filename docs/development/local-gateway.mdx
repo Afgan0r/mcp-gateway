@@ -140,6 +140,81 @@ Strict containment requires an OS containment boundary such as a cgroup.
 Windows process-tree behavior has not been runtime-validated. Stopping a stdio
 Docker client does not prove its containers stopped.
 
+## Container deployment with native integrations
+
+`Dockerfile.gateway` builds the fork's MCP-only entry point on Node 24.16.0.
+The `Gateway image` workflow publishes `ghcr.io/afgan0r/mcp-gateway:latest`
+and an immutable `sha-<commit>` tag after lint, documentation, types, the full
+test suite, distribution verification and a container startup/shutdown smoke
+test pass. The upstream dashboard images have a separate release workflow.
+
+The Hub runs as an unprivileged container. Native stdio integrations run on the
+host through `scripts/host-mcp-broker.mjs`, preserving host browser sandboxing,
+installed application executables, local paths and per-server environment
+bindings. Each relay connection opens a separate named child; retention and
+owner isolation still belong to the Hub. The broker accepts only declared
+commands from its private configuration, with no arbitrary command or environment
+override in requests. HTTP integrations remain in the Hub.
+
+Both services bind to loopback. Container host networking keeps host-local
+proxies and SSH tunnels reachable; Docker Desktop requires its host-networking
+option for Linux containers. See the [Docker host network documentation](https://docs.docker.com/engine/network/drivers/host/)
+(accessed 2026-10-19). Do not mount the Docker socket or the complete host home
+directory into the Hub.
+
+The host broker reads a mode-0600 absolute JSON configuration:
+
+```json
+{
+  "schemaVersion": 1,
+  "host": "127.0.0.1",
+  "port": 19766,
+  "token": "<separate machine-local bridge credential>",
+  "servers": {
+    "browser": {
+      "command": "/absolute/host/path/to/node",
+      "args": ["/absolute/host/path/to/server.mjs"],
+      "inheritEnv": false,
+      "env": {}
+    }
+  }
+}
+```
+
+Start it with `node scripts/host-mcp-broker.mjs --config /absolute/private/config.json`.
+Keep the broker, relay, Docker cleanup helper and compiled
+`dist/utils/stdioProcessCleanup.js` from the same immutable image revision.
+Relay definitions inside the Hub use `node /app/scripts/host-mcp-relay.mjs
+--server browser`, `inheritEnv: false`, and these explicit environment bindings:
+
+```json
+{
+  "MCP_GATEWAY_BRIDGE_HOST": "127.0.0.1",
+  "MCP_GATEWAY_BRIDGE_PORT": "19766",
+  "MCP_GATEWAY_BRIDGE_TOKEN_FILE": "/run/mcp-gateway/bridge-token"
+}
+```
+
+The token file is a private read-only mount. The Hub assigns an opaque bridge
+session ID and requires an authenticated native-cleanup acknowledgement before
+closing the SDK transport. A failed acknowledgement remains a failed release.
+The broker also cleans up children after an abruptly lost relay. On Linux it
+verifies captured descendants and the child's process group; arbitrary processes
+that escape both boundaries require stronger OS containment.
+
+Deployment installers should pull `latest`, resolve its digest and OCI revision,
+extract helpers from that digest, and preflight the broker and container before
+replacing a working deployment. Run the resolved digest until the next explicit
+installation. An unchanged image and configuration should preserve live owners.
+An actual image change restarts the Hub and loses in-memory upstream state;
+catalog snapshots survive in a private writable mount. Registry credentials and
+application credentials remain machine-local. Public GHCR packages support
+anonymous pulls; first publication defaults to private visibility, configured
+through [GitHub package settings](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
+(accessed 2026-10-19).
+
+## Diagnostic verification
+
 The isolated diagnostic below creates only harmless local counter processes. It
 uses a fresh private settings directory, disables dotenv loading, binds to
 loopback and never installs client configuration automatically:

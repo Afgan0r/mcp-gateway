@@ -1,0 +1,27 @@
+# This allowlist is the gateway build's complete input boundary.
+**
+!Dockerfile.gateway
+!Dockerfile.gateway.dockerignore
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!.pnpmfile.cjs
+!tsconfig.json
+!LICENSE
+!patches/
+!patches/*.patch
+!src/
+!src/**
+!scripts/
+!scripts/build-mcp-client.js
+!scripts/local-gateway.mjs
+!scripts/host-mcp-broker.mjs
+!scripts/host-mcp-relay.mjs
+!scripts/gateway-docker.mjs
+# Never admit secret overlays, even if one is accidentally placed under src/.
+**/.env
+**/.env.*
+**/.secrets
+**/.secrets/**
+**/*.credentials.json
+**/*.credentials.key

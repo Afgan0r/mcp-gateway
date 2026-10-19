@@ -24,6 +24,14 @@ const child = spawn('docker', ['run', '--cidfile', cidfile, ...args.slice(1)], {
 process.stdin.pipe(child.stdin);
 child.stdin.on('error', () => {});
 let stopping = false;
+let requestedStop = false;
+let cleanupVerified = false;
+const acknowledge = (ok) => {
+  if (!process.connected || !process.send) return;
+  process.send({ op: 'dockerCleanup', ok }, () => {
+    if (process.connected) process.disconnect();
+  });
+};
 const cleanup = () => {
   if (stopping) return;
   stopping = true;
@@ -48,11 +56,24 @@ const cleanup = () => {
       if (inspected.status !== 0 || inspected.stdout.trim() || removed.error) {
         process.stderr.write('Owned Docker container cleanup could not be verified\n');
         process.exitCode = 1;
+        acknowledge(false);
         return; // Retain the exact private identity for diagnosis/retry.
       }
+    } else {
+      process.exitCode = 1;
+      acknowledge(false);
+      return;
     }
+  } else {
+    // A close racing Docker creation has no exact identity to verify. Never
+    // acknowledge success from the wrapper process disappearing alone.
+    process.exitCode = 1;
+    acknowledge(false);
+    return;
   }
   fs.rmSync(directory, { recursive: true, force: true });
+  cleanupVerified = true;
+  acknowledge(true);
 };
 child.on('error', () => {
   cleanup();
@@ -60,11 +81,18 @@ child.on('error', () => {
 });
 child.on('exit', (code) => {
   cleanup();
-  process.exitCode = process.exitCode || code || 0;
+  process.stdin.unpipe(child.stdin);
+  process.stdin.pause();
+  process.exitCode = cleanupVerified && requestedStop ? 0 : process.exitCode || code || 0;
 });
-process.stdin.on('end', cleanup);
+process.stdin.on('end', () => {
+  requestedStop = true;
+  cleanup();
+  if (!child.killed) child.kill('SIGTERM');
+});
 for (const signal of ['SIGTERM', 'SIGINT'])
   process.on(signal, () => {
+    requestedStop = true;
     cleanup();
     if (!child.killed) child.kill('SIGTERM');
   });

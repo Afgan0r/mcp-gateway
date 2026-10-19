@@ -27,6 +27,7 @@ import type { RequestPrincipal } from './authorizationService.js';
 import { PrincipalRuntimeService } from './principalRuntimeService.js';
 import { RuntimeOwnerService } from './runtimeOwnerService.js';
 import { closeTrackedStdioProcessTree } from '../utils/stdioProcessCleanup.js';
+import { createStdioClientTransport, isHostBridgeTransport } from '../utils/hostBridgeTransport.js';
 import { UserContextService } from './userContextService.js';
 import { deleteCredentialBindings, missingCredentialError } from './credentialBindingService.js';
 import {
@@ -41,7 +42,6 @@ import path from 'path';
 import fs from 'fs';
 import treeKill from 'tree-kill';
 import { isProcessTreeKillAvailable } from '../utils/processTree.js';
-import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import {
   type Client,
   SSEClientTransport,
@@ -1171,6 +1171,9 @@ const closeOwnedIsolatedClient = async (
   transport: Transport,
 ): Promise<void> => {
   const pid = (transport as Transport & { pid?: number }).pid;
+  // Host cleanup has its own authenticated acknowledgement. Signalling the
+  // relay first would let local SDK shutdown hide an unfinished native tree.
+  if (isHostBridgeTransport(transport)) await transport.close();
   const close = async () => {
     const results = await Promise.allSettled([
       Promise.resolve().then(() => client.close()),
@@ -2092,7 +2095,7 @@ export const createTransportFromConfig = async (name: string, conf: ServerConfig
     );
 
     // Create STDIO transport with potentially wrapped command
-    transport = new StdioClientTransport({
+    transport = createStdioClientTransport({
       cwd: process.cwd(),
       command: finalCommand,
       // Substitute after expansion and proxy argument cleaning so secrets stay literal.

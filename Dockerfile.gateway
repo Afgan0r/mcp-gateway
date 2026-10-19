@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:24.16.0-bookworm-slim AS manifests
+WORKDIR /app
+RUN corepack enable && corepack prepare pnpm@10.12.4 --activate
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs ./
+COPY patches ./patches
+
+FROM manifests AS dependencies
+RUN --mount=type=cache,id=gateway-pnpm,target=/pnpm/store \
+    pnpm install --frozen-lockfile --store-dir /pnpm/store
+
+FROM dependencies AS build
+COPY tsconfig.json ./
+COPY src ./src
+COPY scripts/build-mcp-client.js ./scripts/build-mcp-client.js
+RUN pnpm backend:build
+
+FROM manifests AS production-dependencies
+RUN --mount=type=cache,id=gateway-pnpm,target=/pnpm/store \
+    pnpm install --prod --frozen-lockfile --store-dir /pnpm/store
+
+FROM node:24.16.0-bookworm-slim AS runtime
+# tree-kill uses ps; tini reaps children and forwards termination to the group.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates procps tini \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ENV NODE_ENV=production \
+    HOST=127.0.0.1 \
+    PORT=19765
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="MCP Gateway" \
+      org.opencontainers.image.source="https://github.com/afgan0r/mcp-gateway" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      io.mcphub.gateway.host-bridge-contract="1"
+COPY --from=production-dependencies /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json LICENSE ./
+COPY scripts/local-gateway.mjs scripts/host-mcp-broker.mjs scripts/host-mcp-relay.mjs scripts/gateway-docker.mjs ./scripts/
+USER node
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+CMD ["node", "scripts/local-gateway.mjs"]
