@@ -121,7 +121,7 @@ describeLinux('native host MCP bridge', () => {
               'run',
               '--rm',
               '-i',
-              'node:22',
+              'node:24.16.0-bookworm-slim',
               'node',
               '-e',
               dockerProgram,
@@ -381,13 +381,13 @@ describeLinux('native host MCP bridge', () => {
   dockerTest(
     'verifies real Docker removal before owner release while another container remains usable',
     async () => {
-      const image = spawnSync('docker', ['image', 'inspect', 'node:22'], {
+      const image = spawnSync('docker', ['image', 'inspect', 'node:24.16.0-bookworm-slim'], {
         timeout: 5000,
         stdio: 'pipe',
       });
       if (image.status !== 0)
         throw new Error(
-          'Docker is healthy; run docker pull node:22 before the host bridge Docker test',
+          'Docker is healthy; run docker pull node:24.16.0-bookworm-slim before the host bridge Docker test',
         );
       const firstId = randomUUID();
       const first = start(['--server', 'docker'], undefined, firstId);

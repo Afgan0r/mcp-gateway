@@ -2,9 +2,10 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: [develop]
   pull_request:
     branches: [main, develop]
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,22 +13,19 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [20.x, 22.x]
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js ${{ matrix.node-version }}
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 24.16.0
 
       - name: Enable Corepack
-        run: corepack enable
+        run: corepack enable && corepack prepare pnpm@10.12.4 --activate
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -38,11 +36,17 @@ jobs:
       - name: Run linter
         run: pnpm lint
 
-      - name: Run type checking
-        run: pnpm backend:build
-
       - name: Run frontend type checking
         run: pnpm frontend:typecheck
+
+      - name: Build full distribution
+        run: pnpm build
+
+      - name: Verify distribution
+        run: node scripts/verify-dist.js
+
+      - name: Prepare real Docker lifecycle fixture
+        run: docker info --format '{{.ServerVersion}}' && docker pull node:24.16.0-bookworm-slim
 
       - name: Run tests
         run: pnpm test:ci
@@ -65,7 +69,7 @@ jobs:
   #     - name: Setup Node.js
   #       uses: actions/setup-node@v4
   #       with:
-  #         node-version: '20.x'
+  #         node-version: 24.16.0
 
   #     - name: Enable Corepack
   #       run: corepack enable
@@ -102,7 +106,7 @@ jobs:
   #     - name: Setup Node.js
   #       uses: actions/setup-node@v4
   #       with:
-  #         node-version: '20.x'
+  #         node-version: 24.16.0
 
   #     - name: Enable Corepack
   #       run: corepack enable

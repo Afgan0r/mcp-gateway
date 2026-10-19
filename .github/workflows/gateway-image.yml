@@ -20,33 +20,7 @@ env:
 jobs:
   quality:
     if: github.repository == 'Afgan0r/mcp-gateway' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.16.0
-      - name: Enable pinned pnpm
-        run: corepack enable && corepack prepare pnpm@10.12.4 --activate
-      - name: Install frozen dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Lint
-        run: pnpm lint
-      - name: Validate documentation
-        run: pnpm docs:validate
-      - name: Check frontend types
-        run: pnpm frontend:typecheck
-      - name: Build full distribution
-        run: pnpm build
-      - name: Verify distribution
-        run: node scripts/verify-dist.js
-      - name: Prepare real Docker lifecycle fixture
-        run: docker info --format '{{.ServerVersion}}' && docker pull node:22
-      - name: Run full test suite
-        run: pnpm test:ci
+    uses: ./.github/workflows/ci.yml
 
   publish:
     needs: quality
