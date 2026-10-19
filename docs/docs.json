@@ -16,11 +16,7 @@
         "groups": [
           {
             "group": "Get Started",
-            "pages": [
-              "index",
-              "quickstart",
-              "installation"
-            ]
+            "pages": ["index", "quickstart", "installation"]
           },
           {
             "group": "Core Features",
@@ -52,6 +48,7 @@
               "development",
               "development/getting-started",
               "development/architecture",
+              "development/local-gateway",
               "development/embedding-lifecycle",
               "development/contributing"
             ]
@@ -63,11 +60,7 @@
         "groups": [
           {
             "group": "开始使用",
-            "pages": [
-              "zh/index",
-              "zh/quickstart",
-              "zh/installation"
-            ]
+            "pages": ["zh/index", "zh/quickstart", "zh/installation"]
           },
           {
             "group": "核心功能",
@@ -109,9 +102,7 @@
           },
           {
             "group": "OpenAPI Endpoints",
-            "pages": [
-              "api-reference/openapi"
-            ]
+            "pages": ["api-reference/openapi"]
           },
           {
             "group": "Management Endpoints",
@@ -143,9 +134,7 @@
           },
           {
             "group": "OpenAPI 端点",
-            "pages": [
-              "zh/api-reference/openapi"
-            ]
+            "pages": ["zh/api-reference/openapi"]
           },
           {
             "group": "管理端点",

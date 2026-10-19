@@ -21,6 +21,7 @@ const mockClient = {
   listTools: mockListTools,
   listPrompts: jest.fn().mockResolvedValue({ prompts: [] }),
   listResources: jest.fn().mockResolvedValue({ resources: [] }),
+  listResourceTemplates: jest.fn().mockResolvedValue({ resourceTemplates: [] }),
   callTool: mockCallTool,
 };
 
@@ -125,6 +126,7 @@ jest.mock('../../src/config/index.js', () => ({
   expandEnvVars: jest.fn((value: string) => value),
   replaceEnvVars: jest.fn((value: any) => value),
   getNameSeparator: jest.fn(() => '::'),
+  getSettingsPath: jest.fn(() => '/catalog-test/settings.json'),
   default: {
     mcpHubName: 'test-hub',
     mcpHubVersion: '1.0.0',
@@ -133,6 +135,10 @@ jest.mock('../../src/config/index.js', () => ({
 }));
 
 import * as mcpService from '../../src/services/mcpService.js';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { remainingListTtl } from '../../src/utils/listFreshness.js';
 
 const ON_DEMAND_CONFIG = {
   name: 'demo',
@@ -187,6 +193,152 @@ describe('startOnDemand lifecycle', () => {
 
   afterEach(() => {
     createTransportSpy.mockRestore();
+  });
+
+  describe('opt-in persistent catalog', () => {
+    let directory: string;
+    let prior: string | undefined;
+    const config = {
+      ...ON_DEMAND_CONFIG,
+      catalogMode: 'persistent' as const,
+      perSessionClient: true,
+    };
+    beforeEach(async () => {
+      prior = process.env.MCPHUB_CATALOG_DIR;
+      directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mcphub-on-demand-catalog-'));
+      process.env.MCPHUB_CATALOG_DIR = directory;
+      mockFindAll.mockResolvedValue([config]);
+      mockFindById.mockResolvedValue(config);
+      mcpService.setServerInfosForTest([]);
+    });
+    afterEach(async () => {
+      mcpService.closeServer('demo');
+      mcpService.setServerInfosForTest([]);
+      if (prior === undefined) delete process.env.MCPHUB_CATALOG_DIR;
+      else process.env.MCPHUB_CATALOG_DIR = prior;
+      await fs.rm(directory, { recursive: true, force: true });
+    });
+
+    it('never primes or spawns during cold startup or ordinary discovery', async () => {
+      await mcpService.initializeClientsFromSettings(true);
+      expect(
+        (await mcpService.handleListToolsRequest({}, {})).tools.map((tool: any) => tool.name),
+      ).toEqual(['mcphub_catalog_status', 'mcphub_catalog_refresh']);
+      expect(
+        (await mcpService.handleListResourceTemplatesRequest({}, {})).resourceTemplates,
+      ).toEqual([]);
+      expect(mockConnect).not.toHaveBeenCalled();
+      expect(createTransportSpy).not.toHaveBeenCalled();
+    });
+
+    it('bootstraps explicitly, sleeps, and restores raw definitions once across restart', async () => {
+      mockClient.getServerCapabilities.mockReturnValue({
+        tools: {},
+        prompts: {},
+        resources: {},
+      } as any);
+      mockClient.listResourceTemplates.mockResolvedValue({
+        resourceTemplates: [
+          { name: 'record', uriTemplate: 'test://{id}', _meta: { example: true } },
+        ],
+      } as any);
+      await mcpService.initializeClientsFromSettings(true);
+      await mcpService.bootstrapServerCatalog('demo');
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+      expect(mockClient.close).toHaveBeenCalledTimes(1);
+      mcpService.setServerInfosForTest([]);
+      await mcpService.initializeClientsFromSettings(true);
+      const info = mcpService.getServerByName('demo')!;
+      expect(info.tools.map((tool) => tool.name)).toEqual(['demo::ping']);
+      expect(remainingListTtl([info.tools], performance.now(), performance.now())).toBe(0);
+      expect(
+        (await mcpService.handleListResourceTemplatesRequest({}, {})).resourceTemplates,
+      ).toEqual([{ name: 'record', uriTemplate: 'test://{id}', _meta: { example: true } }]);
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+      mockClient.getServerCapabilities.mockReturnValue({ tools: {} });
+    });
+
+    it('treats empty tools as a complete snapshot and does not repeat discovery', async () => {
+      mockListTools.mockResolvedValue({ tools: [] });
+      await mcpService.initializeClientsFromSettings(true);
+      await mcpService.bootstrapServerCatalog('demo');
+      mcpService.setServerInfosForTest([]);
+      await mcpService.initializeClientsFromSettings(false, 'demo');
+      expect(
+        (await mcpService.handleListToolsRequest({}, {})).tools.map((tool: any) => tool.name),
+      ).toEqual(['mcphub_catalog_status', 'mcphub_catalog_refresh']);
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops definitions immediately when effective launch configuration changes', async () => {
+      await mcpService.initializeClientsFromSettings(true);
+      await mcpService.bootstrapServerCatalog('demo');
+      mockFindById.mockResolvedValue({ ...config, args: ['changed.js'] });
+      expect(
+        (await mcpService.handleListToolsRequest({}, {})).tools.map((tool: any) => tool.name),
+      ).toEqual(['mcphub_catalog_status', 'mcphub_catalog_refresh']);
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects an upstream discovery that collides with management tool names', async () => {
+      mockListTools.mockResolvedValue({
+        tools: [
+          { name: 'mcphub_runtime_list', description: 'conflict', inputSchema: { type: 'object' } },
+        ],
+      });
+      await mcpService.initializeClientsFromSettings(true);
+      await expect(mcpService.bootstrapServerCatalog('demo')).rejects.toThrow('reserved MCPHub');
+      expect(mockClient.close).toHaveBeenCalledTimes(1);
+      expect(mcpService.getServerByName('demo')?.tools).toEqual([]);
+    });
+
+    it('waits for temporary catalog discovery to close before starting a foreground call', async () => {
+      const sharedConfig = { ...config, perSessionClient: false };
+      mockFindAll.mockResolvedValue([sharedConfig]);
+      mockFindById.mockResolvedValue(sharedConfig);
+      await mcpService.initializeClientsFromSettings(true);
+      await mcpService.bootstrapServerCatalog('demo');
+      const discovery = deferred<any>();
+      const tool = deferred<any>();
+      const toolStarted = deferred<void>();
+      mockListTools.mockImplementationOnce(() => discovery.promise);
+      mockCallTool.mockImplementationOnce(() => {
+        toolStarted.resolve(undefined);
+        return tool.promise;
+      });
+      const refresh = mcpService.bootstrapServerCatalog('demo');
+      await new Promise((resolve) => setImmediate(resolve));
+      const foreground = mcpService.handleCallToolRequest(
+        { params: { name: 'demo::ping', arguments: {} } },
+        { sessionId: 'foreground' },
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockCallTool).not.toHaveBeenCalled();
+      expect(mockClient.close).toHaveBeenCalledTimes(1);
+      discovery.resolve({
+        tools: [{ name: 'ping', description: 'ping', inputSchema: { type: 'object' } }],
+      });
+      await refresh;
+      await toolStarted.promise;
+      expect(mockCallTool).toHaveBeenCalledTimes(1);
+      expect(mockClient.close).toHaveBeenCalledTimes(2);
+      expect(mcpService.getServerByName('demo')?.activeToolCalls).toBe(1);
+      tool.resolve({ content: [{ type: 'text', text: 'pong' }] });
+      expect((await foreground).isError).not.toBe(true);
+    });
+
+    it.each([
+      { oauth: { identityMode: 'personal' } },
+      { passthroughHeaders: ['authorization'] },
+      { type: 'sse', url: 'https://example.invalid' },
+    ])('fails closed for unsupported discovery identity %j', async (unsupported) => {
+      mockFindAll.mockResolvedValue([{ ...config, ...unsupported }]);
+      mockFindById.mockResolvedValue({ ...config, ...unsupported });
+      await mcpService.initializeClientsFromSettings(true);
+      expect(mcpService.getServerByName('demo')?.enabled).toBe(false);
+      await expect(mcpService.bootstrapServerCatalog('demo')).rejects.toThrow();
+      expect(mockConnect).not.toHaveBeenCalled();
+    });
   });
 
   it('wakes a sleeping on-demand server on a regular tools/call and arms idle shutdown', async () => {

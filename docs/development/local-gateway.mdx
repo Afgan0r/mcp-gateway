@@ -1,0 +1,176 @@
+---
+title: 'Local Gateway Prototype'
+description: 'Opt-in persistent discovery and per-owner stdio runtime retention.'
+---
+
+This prototype lets a local gateway retain upstream state independently of a
+client connection. Existing server definitions keep their previous behavior.
+Enable the policies explicitly on shared-authentication stdio servers.
+
+## Configure a server
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/server.mjs"],
+      "catalogMode": "persistent",
+      "retentionPolicy": "explicit"
+    },
+    "lookup": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/lookup.mjs"],
+      "catalogMode": "persistent",
+      "retentionPolicy": "idle",
+      "idleTimeoutMs": 900000
+    }
+  }
+}
+```
+
+`retentionPolicy` implies on-demand startup and a separate upstream client per
+owner. `idle` closes the runtime after 15 minutes without an active operation,
+unless a positive `idleTimeoutMs` overrides that interval. Tool calls, prompt
+retrieval and resource reads hold an operation lease; idle time starts when the
+last operation finishes. `explicit` has no idle expiry and survives the existing
+30-minute application-state cleanup. A zero timeout does not disable expiry;
+use `explicit` when state must be retained.
+
+Use a direct `/mcp/browser` or `/mcp/lookup` route to preserve upstream tool names.
+Direct server routes expose those names even without MCP Apps support or runtime
+retention. Direct prompt lists and retrieval use raw upstream names too. Group
+routes continue to use the normal group naming rules, and a group with the same
+name as a server takes precedence. An upstream tool named `search_tools`,
+`describe_tool`, or `call_tool` is forwarded on its direct route.
+
+The authenticated credential, principal and route delimit runtime inventory and
+release permissions. Enable bearer authentication and configure a credential
+before using these controls. Anonymous access, personal-authentication servers,
+passthrough-header discovery and non-stdio transports are outside this prototype;
+unsupported opt-ins fail closed.
+
+## Limit child environment inheritance
+
+Set `inheritEnv: false` on a stdio server to pass only safe OS launch variables
+and its explicit `env` bindings to the child. Trusted operator configuration can
+still expand `${VARIABLE}` placeholders from the gateway environment, including
+inside an explicit `env` binding. Other gateway secrets are omitted from the
+child environment. The default remains full trusted inheritance for compatibility.
+
+HTTP servers can use `perSessionClient: true` without retention. Tools, prompts,
+resource templates and resource reads then share one isolated upstream client for
+the same MCP session or authenticated application-state handle. Direct resource
+reads also forward dynamic URIs absent from `resources/list`, while disabled
+resource entries remain blocked. Dynamic `ui://` resources continue to require
+MCP Apps support. Retention and persistent discovery remain restricted to shared
+stdio servers.
+
+## Discover without launching during ordinary lists
+
+With `catalogMode: "persistent"`, startup and normal tools, prompts, resources and
+resource-template discovery read stored definitions without starting the upstream.
+An unknown catalog initially exposes only gateway control tools. Explicitly call
+`mcphub_catalog_refresh` once to launch a temporary discovery process, store its
+definitions and close it. Then fetch the tool list again. The first actual tool,
+prompt or resource operation creates the owner's runtime.
+
+| MCP control tool         | Arguments                                                             | Result                                                                                              |
+| ------------------------ | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `mcphub_catalog_status`  | Optional `server_name`                                                | Array with server name, catalog mode, loaded flag and definition counts                             |
+| `mcphub_catalog_refresh` | Optional `server_name`; required when more than one server is visible | `{ "server_name": "browser", "refreshed": true }`                                                   |
+| `mcphub_runtime_list`    | Optional `server_name`                                                | Array of retained owner IDs, server names, policies, timestamps, active-operation counts and status |
+| `mcphub_runtime_release` | Optional `owner_id` and `server_name`                                 | Array of owner IDs and `released`, `releasing` or `close_failed` status                             |
+
+Results are JSON text in the first MCP text-content block. A failed control call
+sets `isError`. Upstream tools cannot use these reserved control names.
+
+Refresh the catalog explicitly after upgrading an upstream package. Definitions
+are bound to effective launch configuration; an unchanged command using a moving
+package version cannot reveal a remote package update without discovery. This
+prototype preserves the existing single-page discovery boundary; it does not
+aggregate paginated upstream catalogs.
+
+Catalogs retain upstream initialization instructions and server version so a cold
+gateway can advertise them without starting the server. Older snapshots without
+these optional fields remain readable.
+
+Catalogs contain raw upstream definitions, including metadata, rather than
+route-specific aliases or permission projections. Current route visibility and
+tool policy are applied when serving each request. Empty discovery is a valid
+snapshot; it does not repeatedly launch a server.
+
+Catalog files and the fingerprint key live outside the repository. The default
+directory is `$XDG_STATE_HOME/mcphub/catalog` (or
+`~/.local/state/mcphub/catalog`) on Linux and `%LOCALAPPDATA%/mcphub/catalog` on
+Windows. `MCPHUB_CATALOG_DIR` overrides it. Keep one gateway writer per catalog
+directory and preserve its private key with the snapshots. Configuration secrets
+are represented by keyed fingerprints, not copied into snapshot identities.
+
+## Release one owner
+
+Call `mcphub_runtime_list`, select an opaque `ownerId`, then pass it as `owner_id`
+to `mcphub_runtime_release`. Releasing one owner leaves other owners running.
+Without `owner_id`, release selects this connection or application-state owner's
+runtimes within the selected servers. Active operations drain before normal
+release closes the process. A failed close remains visible and can be retried.
+
+A new transport creates a new owner unless the client supplies a supported
+application-state identifier. Real Codex Desktop and CLI probes on Ubuntu supplied
+distinct MCP transport sessions but no stable chat identifier. Therefore automatic
+reattachment after transport recreation is not established. A detached explicit
+owner remains available in inventory to another connection using the same
+authenticated scope; release it explicitly when finished.
+
+Owners and live processes are held in gateway memory. A gateway restart preserves
+the catalog, not the upstream's in-memory state. Explicit retention also does not
+override deliberate shutdown, server deletion, credential/configuration
+invalidation or process failure. Use different credentials when callers must not
+be able to inspect or release each other's runtimes on the same route.
+
+## Process cleanup and verification
+
+On Linux, cleanup snapshots descendants before closing the stdio transport,
+records process start times, sends SIGTERM, then sends SIGKILL to surviving
+captured processes even if their parent has exited. Zombies count as terminated.
+This is a snapshot guarantee: a process that forks after capture can escape it.
+Strict containment requires an OS containment boundary such as a cgroup.
+Windows process-tree behavior has not been runtime-validated. Stopping a stdio
+Docker client does not prove its containers stopped.
+
+The isolated diagnostic below creates only harmless local counter processes. It
+uses a fresh private settings directory, disables dotenv loading, binds to
+loopback and never installs client configuration automatically:
+
+```sh
+pnpm exec tsx scripts/probe-codex-identity.mjs --prototype --self-test
+```
+
+It checks cold discovery, bootstrap cleanup, two isolated transport owners,
+selective release, detached-owner release, active-call protection, idle restart,
+modern application-state draining and catalog reload. It records Linux PSS for
+the fixture processes before and after release. These measurements verify that
+the test processes release memory; they do not quantify savings for production
+MCP servers. The test shortens idle expiry to 400 ms; the normal default remains
+15 minutes.
+
+To pilot an installed Playwright MCP with real browsers, supply its local entry
+point instead of the counter fixture:
+
+```sh
+pnpm exec tsx scripts/probe-codex-identity.mjs --playwright-cli /absolute/path/to/@playwright/mcp/cli.js
+```
+
+This mode uses headless, isolated browser contexts, disables Playwright's own
+browser idle timeout and serves a local state-check page at `/pilot`. It keeps
+browser files separate from existing profiles. An optional
+`--browser-executable /absolute/path/to/browser` selects an installed browser.
+Browser sandboxing remains enabled; the host must support the selected binary's
+sandbox. On Linux the temporary profile directory uses a short private cache
+path: Chrome can fail with `SIGTRAP` under a deeply nested temporary directory.
+The diagnostic prints a private client configuration fragment for explicit test
+registration. Use the runtime controls to release the test owners after checking
+state isolation, then stop the diagnostic. Registering a server does not prove
+that an already-open client has refreshed its MCP tool catalog.

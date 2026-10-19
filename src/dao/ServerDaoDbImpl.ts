@@ -93,6 +93,8 @@ export class ServerDaoDbImpl implements ServerDao {
     const server = await this.repository.create({
       name: entity.name,
       type: entity.type,
+      catalogMode: entity.catalogMode,
+      retentionPolicy: entity.retentionPolicy,
       description: entity.description,
       url: entity.url,
       command: entity.command,
@@ -114,6 +116,7 @@ export class ServerDaoDbImpl implements ServerDao {
       openapi: entity.openapi,
       passthroughHeaders: entity.passthroughHeaders,
       perSessionClient: entity.perSessionClient,
+      inheritEnv: entity.inheritEnv,
       credentialTemplate: entity.credentialTemplate,
     });
     return this.mapToServerConfig(server);
@@ -167,7 +170,10 @@ export class ServerDaoDbImpl implements ServerDao {
     assignNullable('openapi');
     assignNullable('passthroughHeaders');
     assignNullable('perSessionClient');
+    assignNullable('inheritEnv');
     assignNullable('credentialTemplate');
+    assignNullable('catalogMode');
+    assignNullable('retentionPolicy');
 
     // Mirror startOnDemand/idleTimeoutMs into `options`, the same way create()
     // does, so partial updates that bypass normalizeServerConfigForPersistence
@@ -285,6 +291,8 @@ export class ServerDaoDbImpl implements ServerDao {
   private mapToServerConfig(server: {
     name: string;
     type?: string;
+    catalogMode?: 'persistent';
+    retentionPolicy?: 'idle' | 'explicit';
     description?: string;
     url?: string;
     command?: string;
@@ -306,6 +314,7 @@ export class ServerDaoDbImpl implements ServerDao {
     openapi?: Record<string, any>;
     passthroughHeaders?: string[];
     perSessionClient?: boolean;
+    inheritEnv?: boolean;
     credentialTemplate?: ServerConfig['credentialTemplate'];
   }): ServerConfigWithName {
     // startOnDemand/idleTimeoutMs (#1012) have no dedicated columns on the `servers`
@@ -321,6 +330,8 @@ export class ServerDaoDbImpl implements ServerDao {
     return {
       name: server.name,
       type: server.type as 'stdio' | 'sse' | 'streamable-http' | 'openapi' | undefined,
+      catalogMode: server.catalogMode,
+      retentionPolicy: server.retentionPolicy,
       description: server.description,
       url: server.url,
       command: server.command,
@@ -342,6 +353,7 @@ export class ServerDaoDbImpl implements ServerDao {
       openapi: server.openapi,
       passthroughHeaders: server.passthroughHeaders,
       perSessionClient: server.perSessionClient,
+      inheritEnv: server.inheritEnv,
       credentialTemplate: server.credentialTemplate,
       startOnDemand,
       idleTimeoutMs,

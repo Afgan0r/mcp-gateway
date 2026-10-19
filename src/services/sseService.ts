@@ -182,11 +182,32 @@ type BearerAuthResult =
       keyName?: string;
       kind?: BearerKeyKind;
       hostedAuth?: HostedAuthContext;
+      /** Produced only after this request's bearer credential has been verified. */
+      credentialFingerprint?: string;
     }
   | {
       valid: false;
       reason: 'missing' | 'invalid' | 'forbidden' | 'unavailable';
     };
+
+const fingerprintVerifiedCredential = (token: string): string =>
+  createHash('sha256').update(token).digest('hex');
+
+/** Shared by modern HTTP, legacy HTTP and SSE after their authentication gates. */
+const setAuthenticatedClientStateScope = (
+  result: BearerAuthResult,
+  username: string | undefined,
+  group: string | undefined,
+): void => {
+  const context = RequestContextService.getInstance().getRequestContext();
+  if (!context) return;
+  context.clientStateScope =
+    result.valid && result.credentialFingerprint
+      ? createHash('sha256')
+          .update(JSON.stringify([result.credentialFingerprint, username || '', group || '']))
+          .digest('hex')
+      : undefined;
+};
 
 /**
  * Check if a string is a valid UUID v4 format
@@ -431,6 +452,7 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
         keyName: hostedAuth.apiKeyPrefix,
         kind: 'system',
         hostedAuth,
+        credentialFingerprint: fingerprintVerifiedCredential(hostedToken),
       };
     } catch (error) {
       if (error instanceof HostedAuthUnavailableError) {
@@ -456,6 +478,9 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
       valid: true,
       user: forwardAuthResult.user,
       keyName: FORWARD_AUTH_METHOD_LABEL,
+      credentialFingerprint: presentedToken
+        ? fingerprintVerifiedCredential(presentedToken)
+        : undefined,
     };
   }
 
@@ -511,7 +536,12 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
     const oauthUser = await resolveOAuthUserFromToken(token);
     if (oauthUser) {
       logger.log('Authenticated request using OAuth bearer token without configured keys');
-      return { valid: true, user: oauthUser, keyName: OAUTH_AUTH_METHOD_LABEL };
+      return {
+        valid: true,
+        user: oauthUser,
+        keyName: OAUTH_AUTH_METHOD_LABEL,
+        credentialFingerprint: fingerprintVerifiedCredential(token),
+      };
     }
 
     logger.warn(
@@ -537,13 +567,18 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
     logger.log(
       `Bearer key authenticated: id=${matchingKey.id}, name=${matchingKey.name}, accessType=${matchingKey.accessType}`,
     );
-    return userKeyResult;
+    return { ...userKeyResult, credentialFingerprint: fingerprintVerifiedCredential(token) };
   }
 
   const oauthUser = await resolveOAuthUserFromToken(token);
   if (oauthUser) {
     logger.log('Authenticated request using OAuth bearer token (no matching static key)');
-    return { valid: true, user: oauthUser, keyName: OAUTH_AUTH_METHOD_LABEL };
+    return {
+      valid: true,
+      user: oauthUser,
+      keyName: OAUTH_AUTH_METHOD_LABEL,
+      credentialFingerprint: fingerprintVerifiedCredential(token),
+    };
   }
 
   logger.warn('Bearer authentication failed: token did not match any key or OAuth user');
@@ -792,6 +827,7 @@ export const handleSseMessage = async (req: Request, res: Response): Promise<voi
     requestContextService.setUsernameContext(username);
     requestContextService.setHostedAuthContext(currentHostedAuth);
     requestContextService.setKeyKindContext(bearerAuthResult.kind);
+    setAuthenticatedClientStateScope(bearerAuthResult, username, group);
 
     await (transport as SSEServerTransport).handlePostMessage(req, res);
   });
@@ -951,14 +987,7 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
       context.sessionId = undefined;
       const requestMeta = (Array.isArray(req.body) ? req.body[0] : req.body)?.params?._meta;
       context.clientCapabilities = requestMeta?.['io.modelcontextprotocol/clientCapabilities'];
-      // Bind application state to the authenticated credential, user and route.
-      // Never treat caller-provided correlation metadata as identity.
-      const token = getBearerTokenFromHeaders(req.headers, systemConfig);
-      if (token && (systemConfig?.routing?.enableBearerAuth ?? true)) {
-        context.clientStateScope = createHash('sha256')
-          .update(JSON.stringify([token, username || '', group || '']))
-          .digest('hex');
-      }
+      setAuthenticatedClientStateScope(bearerAuthResult, username, group);
 
       await getModernMcpNodeHandler()(req, res, req.body);
     });
@@ -1080,6 +1109,7 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
     requestContextService.setHostedAuthContext(
       bearerAuthResult.hostedAuth || transportInfo?.hostedAuth,
     );
+    setAuthenticatedClientStateScope(bearerAuthResult, username, group);
 
     try {
       await transport.handleRequest(req, res, req.body);

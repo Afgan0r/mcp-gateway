@@ -21,6 +21,12 @@ export class Server {
   @Column({ type: 'varchar', length: 50, nullable: true })
   type?: string; // 'stdio', 'sse', 'streamable-http', 'openapi'
 
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  catalogMode?: 'persistent';
+
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  retentionPolicy?: 'idle' | 'explicit';
+
   @Column({ type: 'text', nullable: true })
   description?: string;
 
@@ -88,6 +94,9 @@ export class Server {
 
   @Column({ type: 'boolean', nullable: true })
   perSessionClient?: boolean;
+
+  @Column({ type: 'boolean', nullable: true })
+  inheritEnv?: boolean;
 
   @Column({ type: 'simple-json', nullable: true })
   credentialTemplate?: CredentialSlot[];

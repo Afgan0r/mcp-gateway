@@ -91,6 +91,8 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
           await serverRepo.create({
             name,
             type: config.type,
+            catalogMode: config.catalogMode,
+            retentionPolicy: config.retentionPolicy,
             description: config.description,
             url: config.url,
             command: config.command,
@@ -111,6 +113,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             openapi: config.openapi,
             passthroughHeaders: config.passthroughHeaders,
             perSessionClient: config.perSessionClient,
+            inheritEnv: config.inheritEnv,
             credentialTemplate: config.credentialTemplate,
           });
           logger.log(`  - Created server: ${name}`);

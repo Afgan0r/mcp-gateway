@@ -25,6 +25,8 @@ import {
 } from '../middlewares/toolCallGuard.js';
 import type { RequestPrincipal } from './authorizationService.js';
 import { PrincipalRuntimeService } from './principalRuntimeService.js';
+import { RuntimeOwnerService } from './runtimeOwnerService.js';
+import { closeTrackedStdioProcessTree } from '../utils/stdioProcessCleanup.js';
 import { UserContextService } from './userContextService.js';
 import { deleteCredentialBindings, missingCredentialError } from './credentialBindingService.js';
 import {
@@ -129,6 +131,16 @@ import {
   resolveRunnerPackageVersion,
 } from '../utils/cacheUtils.js';
 import { checkPackageUpdate } from '../utils/packageUpdate.js';
+import { getSettingsPath } from '../config/index.js';
+import {
+  identifyServerCatalog,
+  beginServerCatalogDiscovery,
+  readServerCatalog,
+  writeServerCatalog,
+  invalidateServerCatalog,
+  type ServerCatalog,
+  type CatalogIdentity,
+} from './serverCatalogService.js';
 
 const servers: { [sessionId: string]: Server } = {};
 
@@ -443,6 +455,7 @@ export const getMcpServer = async (sessionId?: string, group?: string): Promise<
 
 export const deleteMcpServer = (sessionId: string): void => {
   delete servers[sessionId];
+  runtimeOwners.detach(sessionId);
   // Clean up any per-session isolated upstream clients for this session
   cleanupIsolatedSession(sessionId);
 };
@@ -570,7 +583,9 @@ const getOrCreateIsolatedClient = async (
     } catch (connectError) {
       // Connect failed — close the client/transport and kill any spawned
       // process tree so a failed handshake doesn't leak resources.
-      closeIsolatedClient(serverInfo.name, client, transport);
+      if (sessionId.startsWith('runtime-owner:'))
+        await closeOwnedIsolatedClient(serverInfo.name, client, transport);
+      else closeIsolatedClient(serverInfo.name, client, transport);
       throw connectError;
     }
 
@@ -580,7 +595,9 @@ const getOrCreateIsolatedClient = async (
       logger.warn(
         `Session ${sessionId} was deleted during isolated client creation for ${serverInfo.name}, closing new client`,
       );
-      closeIsolatedClient(serverInfo.name, client, transport);
+      if (sessionId.startsWith('runtime-owner:'))
+        await closeOwnedIsolatedClient(serverInfo.name, client, transport);
+      else closeIsolatedClient(serverInfo.name, client, transport);
       throw new Error(`Session ${sessionId} no longer exists`);
     }
 
@@ -888,6 +905,148 @@ const normalizeResourceForCache = (resource: McpResource): Resource => {
 // Store all server information
 let serverInfos: ServerInfo[] = [];
 
+const persistentCatalogs = new WeakMap<
+  ServerInfo,
+  { identity: CatalogIdentity; catalog?: ServerCatalog }
+>();
+const memoryCatalogs = new WeakMap<ServerInfo, ServerCatalog>();
+const catalogRefreshes = new WeakMap<ServerInfo, Promise<void>>();
+const CONTROL_TOOL_NAMES = new Set([
+  'mcphub_runtime_list',
+  'mcphub_runtime_release',
+  'mcphub_catalog_status',
+  'mcphub_catalog_refresh',
+]);
+class ControlToolCollisionError extends Error {}
+
+const assertControlToolNamesAvailable = (serverName: string, tools: Array<{ name: string }>) => {
+  if (
+    tools.some((tool) => CONTROL_TOOL_NAMES.has(normalizeToolNameForServer(serverName, tool.name)))
+  ) {
+    throw new ControlToolCollisionError(
+      'Upstream tool name collides with a reserved MCPHub runtime/catalog control',
+    );
+  }
+};
+
+const assertPersistentCatalogSupported = (conf: ServerConfig): void => {
+  if (conf.catalogMode !== 'persistent') return;
+  if (!isStdioServer(conf) || hasPersonalAuthentication(conf) || conf.passthroughHeaders?.length) {
+    throw new Error(
+      'Persistent catalogs support shared stdio servers without personal authentication or passthrough headers only',
+    );
+  }
+};
+
+const applyRuntimeRetention = <T extends ServerConfig>(conf: T): T => {
+  if (conf.retentionPolicy === undefined) return conf;
+  if (
+    !['idle', 'explicit'].includes(conf.retentionPolicy) ||
+    !isStdioServer(conf) ||
+    hasPersonalAuthentication(conf) ||
+    conf.passthroughHeaders?.length
+  ) {
+    throw new Error(
+      'Runtime retention supports shared stdio servers without personal authentication or passthrough headers only; retentionPolicy must be idle or explicit',
+    );
+  }
+  return { ...conf, startOnDemand: true, perSessionClient: true };
+};
+
+// Projection choices stay live and do not alter the upstream discovery identity.
+// Include the full effective inherited environment: a PATH, token or HOME change
+// may change what a stdio command discovers. Only its keyed digest reaches disk.
+const persistentDiscoveryConfig = async (conf: ServerConfig): Promise<unknown> => {
+  const {
+    tools,
+    prompts,
+    resources,
+    description,
+    visibility,
+    sharedWithUsers,
+    enabled,
+    startOnDemand,
+    idleTimeoutMs,
+    retentionPolicy,
+    perSessionClient,
+    ...discovery
+  } = conf;
+  return {
+    discovery,
+    environment: await getServerEnvironment(conf),
+    normalizationVersion: 1,
+    separator: getNameSeparator(),
+  };
+};
+
+const persistentIdentity = async (name: string, conf: ServerConfig): Promise<CatalogIdentity> =>
+  identifyServerCatalog(getSettingsPath(), name, await persistentDiscoveryConfig(conf));
+
+const discoveryConfigurationChanged = async (
+  previous: ServerConfig | undefined,
+  next: ServerConfig | undefined,
+): Promise<boolean> =>
+  !previous ||
+  !next ||
+  JSON.stringify(await persistentDiscoveryConfig(previous)) !==
+    JSON.stringify(await persistentDiscoveryConfig(next));
+
+const clearPersistentDefinitions = (info: ServerInfo): void => {
+  info.tools = [];
+  info.prompts = [];
+  info.resources = [];
+  info.instructions = undefined;
+  info.version = undefined;
+  persistentCatalogs.delete(info);
+  memoryCatalogs.delete(info);
+};
+
+const restorePersistentCatalog = async (info: ServerInfo): Promise<void> => {
+  const identity = await persistentIdentity(info.name, info.config!);
+  const catalog = await readServerCatalog(identity);
+  clearPersistentDefinitions(info);
+  persistentCatalogs.set(info, { identity, catalog });
+  if (catalog) {
+    info.instructions = catalog.instructions;
+    info.version = catalog.serverVersion;
+    assertControlToolNamesAvailable(info.name, catalog.tools ?? []);
+    // These are raw upstream definitions; normalize exactly once. JSON restore
+    // deliberately carries no upstream freshness provenance (ADR-0004).
+    updateServerToolsCache(info, catalog.tools ?? []);
+    updateServerPromptsCache(info, catalog.prompts ?? []);
+    updateServerResourcesCache(info, catalog.resources ?? []);
+  }
+};
+
+const validatePersistentCatalogs = async (): Promise<void> => {
+  for (const info of serverInfos) {
+    if (info.config?.catalogMode !== 'persistent') continue;
+    const raw = await getServerDao().findById(info.name);
+    try {
+      if (!raw || raw.enabled === false || raw.catalogMode !== 'persistent')
+        throw new Error('Catalog configuration removed or disabled');
+      const conf = applyRuntimeRetention(await expandServerConfig(raw));
+      assertPersistentCatalogSupported(conf);
+      const identity = await persistentIdentity(info.name, conf);
+      const prior = persistentCatalogs.get(info)?.identity;
+      if (prior?.fingerprint !== identity.fingerprint || prior.revision !== identity.revision) {
+        closeServerRuntime(info);
+        info.status = 'disconnected';
+        info.config = { ...conf, startOnDemand: true };
+        await restorePersistentCatalog(info);
+      }
+      info.owner = conf.owner;
+      info.visibility = conf.visibility;
+      info.sharedWithUsers = conf.sharedWithUsers;
+      info.enabled = true;
+    } catch {
+      if (info.client) closeServerRuntime(info);
+      clearPersistentDefinitions(info);
+      info.enabled = false;
+    }
+  }
+};
+
 /**
  * How many upstream connections an initialization pass may open at once.
  * Unset, empty or `0` keeps the previous behaviour of connecting every enabled
@@ -1004,6 +1163,149 @@ const sessionIsolatedClients = new Map<string, Map<string, { client: Client; tra
 // Locks to prevent concurrent creation of the same isolated client
 const isolatedClientCreationLocks = new Map<string, Promise<any>>();
 
+const ownedStateId = (ownerId: string): string => `runtime-owner:${ownerId}`;
+
+const closeOwnedIsolatedClient = async (
+  serverName: string,
+  client: Client,
+  transport: Transport,
+): Promise<void> => {
+  const pid = (transport as Transport & { pid?: number }).pid;
+  const close = async () => {
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => client.close()),
+      Promise.resolve().then(() => transport.close?.()),
+    ]);
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
+  };
+  if (process.platform === 'linux' && typeof pid === 'number') {
+    await closeTrackedStdioProcessTree(pid, close);
+  } else {
+    await close();
+    if (typeof pid === 'number') killStdioProcessTree(serverName, pid);
+  }
+};
+
+const runtimeOwners = new RuntimeOwnerService(async (ownerId, serverName) => {
+  const stateId = ownedStateId(ownerId);
+  // Security/configuration shutdown can race an unfinished handshake. Wait for
+  // that child to become trackable before removing its exact owner/server entry.
+  await isolatedClientCreationLocks.get(`${stateId}:${serverName}`)?.catch(() => undefined);
+  const clients = sessionIsolatedClients.get(stateId);
+  const owned = clients?.get(serverName);
+  if (owned) {
+    await closeOwnedIsolatedClient(serverName, owned.client, owned.transport);
+    clients!.delete(serverName);
+  }
+  if (clients && !clients.size) sessionIsolatedClients.delete(stateId);
+});
+
+const retentionConfigurations = new Map<string, string>();
+let retentionShutdown = false;
+
+const validateRuntimeRetentionConfigurations = async (): Promise<void> => {
+  for (const info of serverInfos) {
+    if (!info.config?.retentionPolicy && !retentionConfigurations.has(info.name)) continue;
+    const raw = await getServerDao().findById(info.name);
+    const snapshot = JSON.stringify(raw);
+    const previous = retentionConfigurations.get(info.name);
+    if (previous !== undefined && previous !== snapshot) {
+      await runtimeOwners.invalidate({ serverName: info.name });
+      if (
+        info.config?.catalogMode !== 'persistent' &&
+        (await discoveryConfigurationChanged(
+          info.config,
+          raw ? await expandServerConfig(raw) : undefined,
+        ))
+      )
+        clearPersistentDefinitions(info);
+    }
+    retentionConfigurations.set(info.name, snapshot);
+    if (!raw || raw.enabled === false || !raw.retentionPolicy) {
+      await runtimeOwners.invalidate({ serverName: info.name });
+      info.enabled = false;
+      continue;
+    }
+    try {
+      info.config = applyRuntimeRetention(await expandServerConfig(raw));
+      info.owner = raw.owner;
+      info.visibility = raw.visibility;
+      info.sharedWithUsers = raw.sharedWithUsers;
+      info.enabled = true;
+    } catch (error) {
+      await runtimeOwners.invalidate({ serverName: info.name });
+      info.enabled = false;
+      info.error = formatErrorForLogging(error);
+    }
+  }
+};
+
+const runtimeScope = (): string => {
+  const scope = RequestContextService.getInstance().getRequestContext()?.clientStateScope;
+  if (!scope) throw new Error('Runtime retention requires a verified bearer credential');
+  return scope;
+};
+
+const resolveModernStateHandle = (openAiSession?: unknown): string => {
+  const explicitHandle = RequestContextService.getInstance().getHeader('x-mcphub-state-id');
+  if (explicitHandle !== undefined) {
+    if (
+      typeof explicitHandle !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(explicitHandle)
+    ) {
+      throw new Error('X-MCPHub-State-Id must be a UUID v4');
+    }
+    return explicitHandle.toLowerCase();
+  }
+  if (typeof openAiSession === 'string' && openAiSession.trim()) {
+    return `openai:${createHash('sha256').update(openAiSession).digest('hex')}`;
+  }
+  throw new Error(
+    'Stateful tools on stateless MCP require X-MCPHub-State-Id (UUID v4) or _meta["openai/session"]',
+  );
+};
+
+const runtimeCorrelation = (request: any, extra: any): string => {
+  const context = RequestContextService.getInstance().getRequestContext();
+  const correlation = context?.stateless
+    ? resolveModernStateHandle(request.params?._meta?.['openai/session'])
+    : extra?.sessionId;
+  if (!correlation || ['api-session', 'openapi-session'].includes(correlation)) {
+    throw new Error('Runtime retention requires a real MCP transport or application state handle');
+  }
+  return correlation;
+};
+
+const acquireRuntimeOwner = (info: ServerInfo, request: any, extra: any) => {
+  if (retentionShutdown)
+    throw new Error('Gateway is shutting down; new runtime work is unavailable');
+  const conf = applyRuntimeRetention(info.config!);
+  return runtimeOwners.acquire({
+    scope: runtimeScope(),
+    correlation: runtimeCorrelation(request, extra),
+    serverName: info.name,
+    retentionPolicy: conf.retentionPolicy!,
+    idleTimeoutMs: conf.idleTimeoutMs,
+  });
+};
+
+const waitForIdleRuntimeOwner = (info: ServerInfo, request: any, extra: any) =>
+  runtimeOwners.waitForIdleClose(runtimeScope(), runtimeCorrelation(request, extra), info.name);
+
+const acquireRuntimeClient = async (info: ServerInfo, request: any, extra: any) => {
+  const closing = waitForIdleRuntimeOwner(info, request, extra);
+  if (closing) await closing;
+  const lease = acquireRuntimeOwner(info, request, extra);
+  try {
+    const isolated = await getOrCreateIsolatedClient(ownedStateId(lease.ownerId), info);
+    return { ...isolated, ownerId: lease.ownerId, release: lease.release };
+  } catch (error) {
+    lease.release();
+    throw error;
+  }
+};
+
 // Explicit application state for modern clients, independent of MCP transports.
 // Active calls pin entries; idle state expires and admission is bounded.
 const CLIENT_STATE_IDLE_MS = 30 * 60 * 1000;
@@ -1028,29 +1330,13 @@ const acquireClientState = (
 ): { id: string; release: () => void } => {
   const contextService = RequestContextService.getInstance();
   const scope = contextService.getRequestContext()?.clientStateScope;
-  const explicitHandle = contextService.getHeader('x-mcphub-state-id');
   if (!scope) {
     throw new Error(
       'Stateful tools on stateless MCP require authenticated bearer access and an application state handle',
     );
   }
 
-  let handle: string;
-  if (explicitHandle !== undefined) {
-    if (
-      typeof explicitHandle !== 'string' ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(explicitHandle)
-    ) {
-      throw new Error('X-MCPHub-State-Id must be a UUID v4');
-    }
-    handle = explicitHandle.toLowerCase();
-  } else if (typeof openAiSession === 'string' && openAiSession.trim()) {
-    handle = `openai:${createHash('sha256').update(openAiSession).digest('hex')}`;
-  } else {
-    throw new Error(
-      'Stateful tools on stateless MCP require X-MCPHub-State-Id (UUID v4) or _meta["openai/session"]',
-    );
-  }
+  const handle = resolveModernStateHandle(openAiSession);
 
   const id = `client-state:${scope}:${handle}`;
   let state = clientStates.get(id);
@@ -1087,6 +1373,39 @@ const acquireClientState = (
   };
 };
 
+// Prompt and resource operations use exactly the state key used by tool calls.
+const acquireOperationClient = async (info: ServerInfo, request: any, extra: any) => {
+  while (catalogRefreshes.has(info)) await catalogRefreshes.get(info);
+  if (info.config?.retentionPolicy) return acquireRuntimeClient(info, request, extra);
+  const releaseDemand = beginOnDemandToolCall(info);
+  let state: ReturnType<typeof acquireClientState> | undefined;
+  try {
+    if (info.config?.startOnDemand && !info.client) await ensureServerReady(info);
+    if (info.config?.perSessionClient && !hasPersonalAuthentication(info.config)) {
+      const context = RequestContextService.getInstance().getRequestContext();
+      state = context?.stateless
+        ? acquireClientState(info, request.params?._meta?.['openai/session'])
+        : undefined;
+      const stateId = state?.id ?? extra?.sessionId;
+      if (!stateId) throw new Error(`Server '${info.name}' requires per-session client isolation`);
+      const isolated = await getOrCreateIsolatedClient(stateId, info);
+      return {
+        client: isolated.client,
+        release: () => {
+          state?.release();
+          releaseDemand?.();
+        },
+      };
+    }
+    if (!info.client) throw new Error(`Client not found for server: ${info.name}`);
+    return { client: info.client, release: () => releaseDemand?.() };
+  } catch (error) {
+    state?.release();
+    releaseDemand?.();
+    throw error;
+  }
+};
+
 export const connectClientWithDiagnostics = async (
   client: Client,
   transport: Transport,
@@ -1111,6 +1430,7 @@ const STDIO_KILL_GRACE_PERIOD_MS = 2000;
 // Test-only helper to set serverInfos directly. Not for production use.
 export const setServerInfosForTest = (infos: ServerInfo[]): void => {
   serverInfos = infos;
+  if (infos.length) retentionShutdown = false;
 };
 
 export const updateServerToolsCache = (
@@ -1280,35 +1600,30 @@ export const connected = (): boolean => {
 };
 
 // Global cleanup function to close all connections
-export const cleanupAllServers = (): void => {
+export const cleanupAllServers = async (): Promise<void> => {
+  retentionShutdown = true;
   stopPackageUpdateSweep();
   if (clientStateSweep) clearInterval(clientStateSweep);
   clientStateSweep = undefined;
   for (const id of clientStates.keys()) removeClientState(id);
   principalRuntimes.invalidate();
+  const ownerCleanup = runtimeOwners.invalidate();
+  retentionConfigurations.clear();
   for (const serverInfo of serverInfos) {
-    try {
-      if (serverInfo.client) {
-        serverInfo.client.close();
-      }
-      if (serverInfo.transport) {
-        serverInfo.transport.close();
-      }
-    } catch (error) {
-      logger.warn('Error closing server', { serverName: serverInfo.name, error });
-    }
+    closeServerRuntime(serverInfo);
   }
   serverInfos = [];
 
   // Drain all per-session isolated upstream clients (perSessionClient: true),
   for (const sessionId of [...sessionIsolatedClients.keys()]) {
-    cleanupIsolatedSession(sessionId);
+    if (!sessionId.startsWith('runtime-owner:')) cleanupIsolatedSession(sessionId);
   }
 
   // Clear session servers as well
   Object.keys(servers).forEach((sessionId) => {
     delete servers[sessionId];
   });
+  await ownerCleanup;
 };
 
 const headerValueToString = (value: string | string[] | undefined): string | undefined => {
@@ -1735,7 +2050,7 @@ export const createTransportFromConfig = async (name: string, conf: ServerConfig
     transport = new SSEClientTransport(new URL(conf.url), options);
   } else if (conf.command) {
     // Stdio transport
-    env['PATH'] = expandEnvVars(process.env.PATH as string) || '';
+    env['PATH'] ??= expandEnvVars(process.env.PATH as string) || '';
 
     const systemConfigDao = getSystemConfigDao();
     const systemConfig = await systemConfigDao.get();
@@ -1975,6 +2290,7 @@ export const initializeClientsFromSettings = async (
   serverName?: string,
   options?: { reportEmbeddingProgress?: boolean },
 ): Promise<ServerInfo[]> => {
+  retentionShutdown = false;
   const allServers: ServerConfigWithName[] = await getServerDao().findAll();
   const existingServerInfos = serverInfos;
   const nextServerInfos: ServerInfo[] = [];
@@ -2006,7 +2322,82 @@ export const initializeClientsFromSettings = async (
       }
 
       // Expand environment variables in all configuration values
-      const expandedConf = await expandServerConfig(conf);
+      let expandedConf = await expandServerConfig(conf);
+      if (expandedConf.retentionPolicy !== undefined) {
+        try {
+          expandedConf = applyRuntimeRetention(expandedConf);
+          const snapshot = JSON.stringify(conf);
+          if (retentionConfigurations.has(name) && retentionConfigurations.get(name) !== snapshot) {
+            await runtimeOwners.invalidate({ serverName: name });
+            const previous = existingServerInfos.find((info) => info.name === name);
+            if (
+              previous &&
+              previous.config?.catalogMode !== 'persistent' &&
+              (await discoveryConfigurationChanged(previous.config, expandedConf))
+            )
+              clearPersistentDefinitions(previous);
+          }
+          retentionConfigurations.set(name, snapshot);
+        } catch (error) {
+          await runtimeOwners.invalidate({ serverName: name });
+          nextServerInfos.push({
+            name,
+            status: 'disconnected',
+            error: formatErrorForLogging(error),
+            tools: [],
+            prompts: [],
+            resources: [],
+            createTime: Date.now(),
+            enabled: false,
+            config: expandedConf,
+          });
+          continue;
+        }
+      } else if (retentionConfigurations.has(name)) {
+        await runtimeOwners.invalidate({ serverName: name });
+        retentionConfigurations.delete(name);
+      }
+
+      if (expandedConf.catalogMode === 'persistent') {
+        const info: ServerInfo = existingServerInfos.find(
+          (candidate) => candidate.name === name,
+        ) ?? {
+          name,
+          status: 'disconnected',
+          error: null,
+          tools: [],
+          prompts: [],
+          resources: [],
+          createTime: Date.now(),
+        };
+        try {
+          assertPersistentCatalogSupported(expandedConf);
+          Object.assign(info, {
+            owner: expandedConf.owner,
+            visibility: expandedConf.visibility,
+            sharedWithUsers: expandedConf.sharedWithUsers,
+            enabled: expandedConf.enabled !== false,
+            config: { ...expandedConf, startOnDemand: true },
+          });
+          const identity = await persistentIdentity(name, expandedConf);
+          const priorIdentity = persistentCatalogs.get(info)?.identity;
+          if (
+            priorIdentity?.fingerprint !== identity.fingerprint ||
+            priorIdentity.revision !== identity.revision
+          ) {
+            if (info.client) closeServerRuntime(info);
+            info.status = 'disconnected';
+            await restorePersistentCatalog(info);
+          }
+        } catch (error) {
+          clearPersistentDefinitions(info);
+          info.enabled = false;
+          info.config = expandedConf;
+          info.error = `Persistent catalog unavailable: ${formatErrorForLogging(error)}`;
+        }
+        nextServerInfos.push(info);
+        continue;
+      }
 
       // Skip disabled servers
       if (expandedConf.enabled === false) {
@@ -2506,6 +2897,12 @@ export const initializeClientsFromSettings = async (
   }
 
   serverInfos = nextServerInfos;
+  for (const name of retentionConfigurations.keys()) {
+    if (!nextServerInfos.some((info) => info.name === name && info.enabled !== false)) {
+      await runtimeOwners.invalidate({ serverName: name });
+      retentionConfigurations.delete(name);
+    }
+  }
   entriesPublished = true;
 
   // Populate the tool cache for on-demand stdio servers so their tools are
@@ -2927,6 +3324,8 @@ export const reinstallServer = async (serverName: string): Promise<void> => {
 
   // Mark server as pending reinstall (consumed by createTransportFromConfig for uvx)
   pendingReinstalls.add(serverName);
+  if (serverConfig.catalogMode === 'persistent')
+    await invalidatePersistentServerCatalog(serverName);
 
   try {
     // For npx, clear cache directory synchronously before reconnect.
@@ -3033,6 +3432,7 @@ export const addServer = async (
 export const removeServer = async (
   name: string,
 ): Promise<{ success: boolean; message?: string }> => {
+  await invalidatePersistentServerCatalog(name);
   const result = await getServerDao().delete(name);
   if (!result) {
     return { success: false, message: 'Failed to remove server' };
@@ -3064,6 +3464,7 @@ export const addOrUpdateServer = async (
   try {
     validateMaxBufferSize(config.options?.maxBufferSize);
     validateCredentialTemplate(config);
+    assertPersistentCatalogSupported(config);
     const exists = await getServerDao().exists(name);
     if (exists && !allowOverride) {
       return { success: false, message: 'Server name already exists' };
@@ -3164,6 +3565,9 @@ const closeServerRuntime = (serverInfo: ServerInfo): void => {
 // initializeClientsFromSettings rebuild drops it if it is no longer configured).
 export function closeServer(name: string) {
   principalRuntimes.invalidate({ serverName: name });
+  void runtimeOwners
+    .invalidate({ serverName: name })
+    .catch((error) => logger.warn('Failed to close retained runtime', { serverName: name, error }));
   const serverInfo = serverInfos.find((serverInfo) => serverInfo.name === name);
   if (serverInfo) {
     closeServerRuntime(serverInfo);
@@ -3200,6 +3604,7 @@ const scheduleIdleShutdown = (serverInfo: ServerInfo): void => {
   clearIdleShutdown(serverInfo);
   if (
     !serverInfo.config?.startOnDemand ||
+    serverInfo.config.retentionPolicy !== undefined ||
     !isStdioServer(serverInfo.config) ||
     hasPersonalAuthentication(serverInfo.config) ||
     serverInfo.status !== 'connected' ||
@@ -3220,6 +3625,7 @@ const scheduleIdleShutdown = (serverInfo: ServerInfo): void => {
 const beginOnDemandToolCall = (serverInfo: ServerInfo): (() => void) | undefined => {
   if (
     !serverInfo.config?.startOnDemand ||
+    serverInfo.config.retentionPolicy !== undefined ||
     !isStdioServer(serverInfo.config) ||
     hasPersonalAuthentication(serverInfo.config)
   ) {
@@ -3267,7 +3673,19 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
     if (rawConfig.enabled === false) {
       throw new Error(`Cannot start disabled on-demand server: ${rawConfig.name}`);
     }
-    const expandedConf = await expandServerConfig(rawConfig);
+    const expandedConf = applyRuntimeRetention(await expandServerConfig(rawConfig));
+    if (expandedConf.catalogMode === 'persistent') {
+      assertPersistentCatalogSupported(expandedConf);
+      expandedConf.startOnDemand = true;
+    }
+    const catalogIdentity =
+      expandedConf.catalogMode === 'persistent'
+        ? beginServerCatalogDiscovery(await persistentIdentity(rawConfig.name, expandedConf))
+        : undefined;
+    const discoveredConfig = catalogIdentity
+      ? JSON.stringify(await persistentDiscoveryConfig(expandedConf))
+      : undefined;
+    if (catalogIdentity) persistentCatalogs.set(serverInfo, { identity: catalogIdentity });
 
     // startOnDemand is a stdio-only optimisation; OpenAPI/HTTP servers have no
     // deferred process to spawn, so there is nothing to wake.
@@ -3280,6 +3698,11 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
 
     const transport = await createTransportFromConfig(name, expandedConf);
     const client = createUpstreamMcpClient(name, () => serverInfo);
+    if (catalogIdentity || expandedConf.retentionPolicy) {
+      // Make failed handshakes visible to the existing shutdown path too.
+      serverInfo.client = client;
+      serverInfo.transport = transport;
+    }
 
     const serverRequestOptions = expandedConf.options || {};
     const defaultRequestTimeout = Number(process.env.DEFAULT_REQUEST_TIMEOUT) || 60000;
@@ -3304,6 +3727,15 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
     serverInfo.status = 'connected';
     serverInfo.error = null;
 
+    const catalog: ServerCatalog = {
+      instructions: serverInfo.instructions,
+      serverVersion: serverInfo.version,
+      tools: null,
+      prompts: null,
+      resources: null,
+      resourceTemplates: null,
+    };
+    let discoveryComplete = true;
     let toolCount = 0;
     let promptCount = 0;
     let resourceCount = 0;
@@ -3311,10 +3743,15 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
     if (capabilities?.tools) {
       try {
         const tools = await client.listTools({}, requestOptions);
+        catalog.tools = tools.tools;
+        if (expandedConf.catalogMode === 'persistent' || expandedConf.retentionPolicy)
+          assertControlToolNamesAvailable(name, tools.tools);
         toolCount = tools.tools.length;
         updateServerToolsCache(serverInfo, tools.tools);
         broadcastToolListChanged();
       } catch (error) {
+        if (error instanceof ControlToolCollisionError) throw error;
+        discoveryComplete = false;
         logger.warn(`[${name}] Failed to list tools during wake`, {
           error: summarizeErrorForLogging(error),
         });
@@ -3323,9 +3760,11 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
     if (capabilities?.prompts) {
       try {
         const prompts = await client.listPrompts({}, requestOptions);
+        catalog.prompts = prompts.prompts;
         promptCount = prompts.prompts.length;
         updateServerPromptsCache(serverInfo, prompts.prompts);
       } catch (error) {
+        discoveryComplete = false;
         logger.warn(`[${name}] Failed to list prompts during wake`, {
           error: summarizeErrorForLogging(error),
         });
@@ -3334,12 +3773,60 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
     if (capabilities?.resources) {
       try {
         const resources = await client.listResources({}, requestOptions);
+        catalog.resources = resources.resources;
         resourceCount = resources.resources.length;
         updateServerResourcesCache(serverInfo, resources.resources);
       } catch (error) {
+        discoveryComplete = false;
         logger.warn(`[${name}] Failed to list resources during wake`, {
           error: summarizeErrorForLogging(error),
         });
+      }
+    }
+
+    if (expandedConf.catalogMode === 'persistent' || expandedConf.retentionPolicy) {
+      if (capabilities?.resources) {
+        try {
+          const templates = await client.listResourceTemplates({}, requestOptions);
+          catalog.resourceTemplates = templates.resourceTemplates;
+        } catch (error) {
+          discoveryComplete = false;
+          logger.warn(`[${name}] Failed to list resource templates during catalog discovery`, {
+            error: summarizeErrorForLogging(error),
+          });
+        }
+      }
+      if (!discoveryComplete) {
+        clearPersistentDefinitions(serverInfo);
+        throw new Error('Persistent catalog discovery incomplete');
+      }
+      if (catalog.tools === null) serverInfo.tools = [];
+      if (catalog.prompts === null) serverInfo.prompts = [];
+      if (catalog.resources === null) serverInfo.resources = [];
+      if (catalogIdentity) {
+        const identity = catalogIdentity;
+        const saved = await writeServerCatalog(identity, catalog, async () => {
+          const current = await getServerDao().findById(name);
+          if (
+            !current ||
+            current.catalogMode !== 'persistent' ||
+            current.enabled === false ||
+            !serverInfos.includes(serverInfo)
+          )
+            return false;
+          const expandedCurrent = await expandServerConfig(current);
+          assertPersistentCatalogSupported(expandedCurrent);
+          return (
+            JSON.stringify(await persistentDiscoveryConfig(expandedCurrent)) === discoveredConfig
+          );
+        });
+        if (saved) persistentCatalogs.set(serverInfo, { identity, catalog });
+        else {
+          clearPersistentDefinitions(serverInfo);
+          throw new Error('Persistent catalog configuration changed during discovery');
+        }
+      } else {
+        memoryCatalogs.set(serverInfo, catalog);
       }
     }
 
@@ -3356,6 +3843,8 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
   try {
     await spawnPromise;
   } catch (error) {
+    if (serverInfo.config?.catalogMode === 'persistent' || serverInfo.config?.retentionPolicy)
+      await closeCatalogRuntime(serverInfo);
     serverInfo.status = 'disconnected';
     serverInfo.error = `Failed to start on-demand server: ${formatErrorForLogging(error)}`;
     throw error;
@@ -3368,6 +3857,74 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
 // and OpenAPI servers have no long-lived child process to skip.
 const isStdioServer = (conf: ServerConfig | undefined): boolean =>
   !!conf && (conf.type === 'stdio' || (!conf.type && !!conf.command));
+
+const closeCatalogRuntime = async (info: ServerInfo): Promise<void> => {
+  clearIdleShutdown(info);
+  if (info.keepAliveIntervalId) clearInterval(info.keepAliveIntervalId);
+  info.keepAliveIntervalId = undefined;
+  const client = info.client;
+  const transport = info.transport;
+  if (client && transport) {
+    await closeOwnedIsolatedClient(info.name, client, transport);
+    if (info.client === client) info.client = undefined;
+    if (info.transport === transport) info.transport = undefined;
+  }
+  info.status = 'disconnected';
+};
+
+/** Explicit operator discovery, including refresh of an already cached catalog. */
+export const bootstrapServerCatalog = async (serverName: string): Promise<void> => {
+  const configured = serverInfos.find((entry) => entry.name === serverName);
+  if (
+    !configured ||
+    !(configured.config?.catalogMode === 'persistent' || configured.config?.retentionPolicy) ||
+    configured.enabled === false
+  )
+    throw new Error('Persistent catalog server unavailable');
+  assertPersistentCatalogSupported(configured.config);
+  applyRuntimeRetention(configured.config);
+  await validateRuntimeRetentionConfigurations();
+  await validatePersistentCatalogs();
+  const info = serverInfos.find((entry) => entry.name === serverName);
+  if (
+    !info ||
+    !(info.config?.catalogMode === 'persistent' || info.config?.retentionPolicy) ||
+    info.enabled === false
+  )
+    throw new Error('Persistent catalog server unavailable');
+  assertPersistentCatalogSupported(info.config);
+  applyRuntimeRetention(info.config);
+  const existingRefresh = catalogRefreshes.get(info);
+  if (existingRefresh) return existingRefresh;
+  if (info.activeToolCalls) throw new Error('Cannot refresh a catalog while calls are active');
+  const refresh = (async () => {
+    if (info.status === 'connected' && !info.spawningPromise) {
+      await closeCatalogRuntime(info);
+    }
+    try {
+      await ensureServerReady(info);
+    } finally {
+      await closeCatalogRuntime(info);
+    }
+  })();
+  catalogRefreshes.set(info, refresh);
+  try {
+    await refresh;
+  } finally {
+    if (catalogRefreshes.get(info) === refresh) catalogRefreshes.delete(info);
+  }
+};
+
+export const invalidatePersistentServerCatalog = async (serverName: string): Promise<void> => {
+  const info = serverInfos.find((entry) => entry.name === serverName);
+  const conf = await getServerDao().findById(serverName);
+  if (conf?.catalogMode !== 'persistent') return;
+  const identity =
+    persistentCatalogs.get(info!)?.identity ??
+    (await persistentIdentity(serverName, await expandServerConfig(conf)));
+  await invalidateServerCatalog(identity);
+  if (info) clearPersistentDefinitions(info);
+};
 
 /**
  * Connects each on-demand stdio server once to populate its tool cache, then
@@ -3386,6 +3943,8 @@ const primeOnDemandServers = (gate?: ConnectGate): Promise<void> => {
   const targets = serverInfos.filter(
     (si) =>
       si.config?.startOnDemand === true &&
+      si.config.catalogMode !== 'persistent' &&
+      si.config.retentionPolicy === undefined &&
       !hasPersonalAuthentication(si.config) &&
       isStdioServer(si.config) &&
       si.tools.length === 0 &&
@@ -3588,7 +4147,8 @@ export const toggleServerStatus = async (
 
 type McpAppsRouteContext = {
   enabled: boolean;
-  // Set when the route has exactly one configured upstream and a connected MCP client.
+  directServerRoute?: boolean;
+  // Set for a single Apps upstream or an opted-in direct server route.
   // Preserves the existing behavior of exposing raw (unqualified) tool
   // names, which most Apps widgets assume when calling back into a
   // single-server host.
@@ -3612,6 +4172,20 @@ const getMcpAppsRouteContext = async (
     : sessionId
       ? servers[sessionId]?.getClientCapabilities()
       : undefined;
+  // Direct server routes preserve upstream names for existing client skills,
+  // independently of whether the client supports MCP Apps. Groups stay qualified.
+  if (group && !isSmartRoutingGroup(group) && !(await findRouteGroup(group))) {
+    const direct = getVisibleServerInfos().find(
+      (info) => info.name === group && info.enabled !== false,
+    );
+    if (direct) {
+      return {
+        enabled: hasMcpAppsCapability(clientCapabilities as any),
+        directServerRoute: true,
+        serverInfo: direct,
+      };
+    }
+  }
   if (!hasMcpAppsCapability(clientCapabilities as any)) {
     return { enabled: false };
   }
@@ -3826,16 +4400,29 @@ async function resolvePromptInGroup(
     await getFilteredServerInfosForGroup(lookupGroup);
 
   for (const serverInfo of filteredServerInfos) {
-    if (serverInfo.status !== 'connected' || serverInfo.enabled === false) {
+    if (!canServeToolRequests(serverInfo)) {
       continue;
     }
 
     const serverConfig = serverConfigsByName.get(serverInfo.name);
     const internalPromptName = resolveNameFromGroup(promptName, serverInfo.name, serverConfig);
-    const prompt = serverInfo.prompts.find((item) => item.name === internalPromptName);
+    const directRoute = lookupGroup === serverInfo.name && !(await findRouteGroup(lookupGroup));
+    const prompt = serverInfo.prompts.find(
+      (item) =>
+        item.name === internalPromptName ||
+        (directRoute && normalizePromptNameForGroup(serverInfo.name, item.name) === promptName),
+    );
     if (!prompt) {
       continue;
     }
+    const config = await getServerDao().findById(serverInfo.name);
+    if (
+      (
+        config?.prompts?.[prompt.name] ??
+        config?.prompts?.[normalizePromptNameForGroup(serverInfo.name, prompt.name)]
+      )?.enabled === false
+    )
+      continue;
 
     const filteredPrompts = await filterPromptsByGroup(
       lookupGroup,
@@ -3847,7 +4434,7 @@ async function resolvePromptInGroup(
       continue;
     }
 
-    return { serverInfo, promptName: internalPromptName };
+    return { serverInfo, promptName: prompt.name };
   }
 
   return undefined;
@@ -3994,6 +4581,132 @@ const getPinnedSmartRoutingTools = async (
   );
 };
 
+const getControlServers = async (group: string | undefined): Promise<ServerInfo[]> => {
+  const { filteredServerInfos } = await getFilteredServerInfosForGroup(getGroupLookupName(group));
+  return filteredServerInfos.filter(
+    (info) => info.config?.retentionPolicy || info.config?.catalogMode === 'persistent',
+  );
+};
+
+const controlToolDefinitions = (infos: ServerInfo[]): Tool[] => {
+  if (!infos.length) return [];
+  const serverProperty = {
+    server_name: { type: 'string', description: 'Optional in-scope server name.' },
+  };
+  const definitions: Tool[] = [
+    {
+      name: 'mcphub_catalog_status',
+      description: 'Inspect cached discovery without starting upstream processes.',
+      inputSchema: { type: 'object', properties: serverProperty, additionalProperties: false },
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: 'mcphub_catalog_refresh',
+      description:
+        'Explicitly discover one server in a temporary upstream process, then close it. Provide server_name on a multi-server route.',
+      inputSchema: { type: 'object', properties: serverProperty, additionalProperties: false },
+    },
+  ];
+  if (infos.some((info) => info.config?.retentionPolicy)) {
+    definitions.push(
+      {
+        name: 'mcphub_runtime_list',
+        description:
+          'List retained runtimes in this authenticated credential, principal and route, including detached owners. Transport IDs do not identify a chat after client recreation.',
+        inputSchema: { type: 'object', properties: serverProperty, additionalProperties: false },
+        annotations: { readOnlyHint: true },
+      },
+      {
+        name: 'mcphub_runtime_release',
+        description:
+          'Release a retained owner after active operations finish. Omit owner_id to release this transport/application-state owner on the selected servers.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            ...serverProperty,
+            owner_id: { type: 'string', description: 'Opaque owner ID from mcphub_runtime_list.' },
+          },
+          additionalProperties: false,
+        },
+      },
+    );
+  }
+  return definitions;
+};
+
+const handleControlTool = async (request: any, extra: any) => {
+  try {
+    const scope = runtimeScope();
+    const name = request.params.name;
+    const args = request.params.arguments ?? {};
+    if (!args || typeof args !== 'object' || Array.isArray(args))
+      throw new Error('Control arguments must be an object');
+    if (
+      Object.keys(args).some((key) => !['server_name', 'owner_id'].includes(key)) ||
+      (args.server_name !== undefined && typeof args.server_name !== 'string') ||
+      (args.owner_id !== undefined && typeof args.owner_id !== 'string')
+    )
+      throw new Error('Invalid runtime/catalog control arguments');
+    let infos = await getControlServers(getMcpRequestGroup(extra));
+    if (extra?.server) infos = infos.filter((info) => info.name === extra.server);
+    if (args.server_name !== undefined)
+      infos = infos.filter((info) => info.name === args.server_name);
+    if (!infos.length) throw new Error('Runtime/catalog server not available on this route');
+    let result: unknown;
+    if (name === 'mcphub_catalog_refresh') {
+      if (infos.length !== 1) throw new Error('server_name is required on a multi-server route');
+      await bootstrapServerCatalog(infos[0].name);
+      result = { server_name: infos[0].name, refreshed: true };
+    } else if (name === 'mcphub_catalog_status') {
+      result = infos.map((info) => ({
+        server_name: info.name,
+        catalog_mode: info.config?.catalogMode ?? 'memory',
+        loaded: !!(persistentCatalogs.get(info)?.catalog ?? memoryCatalogs.get(info)),
+        tools: info.tools.length,
+        prompts: info.prompts.length,
+        resources: info.resources.length,
+        resource_templates:
+          (persistentCatalogs.get(info)?.catalog ?? memoryCatalogs.get(info))?.resourceTemplates
+            ?.length ?? 0,
+      }));
+    } else {
+      const visibleNames = new Set(
+        infos.filter((info) => info.config?.retentionPolicy).map((info) => info.name),
+      );
+      const owners = runtimeOwners
+        .list(scope)
+        .filter((owner) => visibleNames.has(owner.serverName));
+      if (name === 'mcphub_runtime_list') {
+        result = owners;
+      } else {
+        const currentIds =
+          args.owner_id === undefined
+            ? new Set(
+                runtimeOwners
+                  .list(scope, runtimeCorrelation(request, extra))
+                  .map((owner) => owner.ownerId),
+              )
+            : new Set([args.owner_id]);
+        const selected = owners.filter((owner) => currentIds.has(owner.ownerId));
+        if (args.owner_id !== undefined && !selected.length)
+          throw new Error('Runtime owner not found in this authenticated route');
+        result = await Promise.all(
+          selected.map(async (owner) => ({
+            owner_id: owner.ownerId,
+            status: await runtimeOwners.release(scope, owner.ownerId),
+          })),
+        );
+      }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+  } catch (error) {
+    return {
+      content: [{ type: 'text', text: `Error: ${formatErrorForLogging(error)}` }],
+      isError: true,
+    };
+  }
+};
+
 const handleListToolsRequestImpl = async (_: any, extra: any) => {
   const sessionId = extra.sessionId || '';
   const group = getMcpRequestGroup(extra);
@@ -4004,7 +4717,9 @@ const handleListToolsRequestImpl = async (_: any, extra: any) => {
   if (isSmartRoutingGroup(group)) {
     const smartRoutingTools = await getSmartRoutingTools(group);
     let pinnedTools: Tool[] = [];
+    let controls: Tool[] = [];
     try {
+      controls = controlToolDefinitions(await getControlServers(group));
       const appsRouteContext = await getMcpAppsRouteContext(sessionId, group);
       // A pin named like a meta-tool (e.g. alias "describe" + separator "_" +
       // tool "tool") would be intercepted by it on call, even in a mode that
@@ -4016,16 +4731,20 @@ const handleListToolsRequestImpl = async (_: any, extra: any) => {
       // Pins are an optimisation: failing to resolve them must not cost the meta-tools
       logger.warn(`Failed to list pinned tools for ${group}; returning meta-tools only`, error);
     }
-    return pinnedTools.length > 0
-      ? { tools: [...smartRoutingTools.tools, ...pinnedTools] }
+    return pinnedTools.length || controls.length
+      ? { ...smartRoutingTools, tools: [...smartRoutingTools.tools, ...pinnedTools, ...controls] }
       : smartRoutingTools;
   }
 
   const { filteredServerInfos, serverConfigsByName } = await getFilteredServerInfosForGroup(group);
   const appsRouteContext = await getMcpAppsRouteContext(sessionId, group);
+  const controls = controlToolDefinitions(await getControlServers(group));
 
   return {
-    tools: await listGroupTools(group, filteredServerInfos, serverConfigsByName, appsRouteContext),
+    tools: [
+      ...(await listGroupTools(group, filteredServerInfos, serverConfigsByName, appsRouteContext)),
+      ...controls,
+    ],
   };
 };
 
@@ -4100,7 +4819,12 @@ const handleCallToolRequestImpl = async (request: any, extra: any) => {
   let hostedReservation: HostedCreditReservation | null = null;
   let releaseOnDemandToolCall: (() => void) | undefined;
   let clientStateLease: ReturnType<typeof acquireClientState> | undefined;
+  let runtimeOwnerLease: ReturnType<typeof acquireRuntimeOwner> | undefined;
   const getToolStateId = (info: ServerInfo, legacyId: string | undefined): string | undefined => {
+    if (info.config?.retentionPolicy) {
+      runtimeOwnerLease ??= acquireRuntimeOwner(info, request, extra);
+      return ownedStateId(runtimeOwnerLease.ownerId);
+    }
     if (!requestContextService.getRequestContext()?.stateless) return legacyId;
     clientStateLease ??= acquireClientState(info, request.params?._meta?.['openai/session']);
     return clientStateLease.id;
@@ -4129,21 +4853,25 @@ const handleCallToolRequestImpl = async (request: any, extra: any) => {
 
   try {
     appsRouteContext = await getMcpAppsRouteContext(sessionId, group);
+    const upstreamOwnsMetaName =
+      appsRouteContext.directServerRoute &&
+      appsRouteContext.serverInfo &&
+      findToolOnServer(appsRouteContext.serverInfo, request.params.name, true);
 
     // Special handling for smart routing tools
-    if (request.params.name === 'search_tools') {
+    if (!upstreamOwnsMetaName && request.params.name === 'search_tools') {
       const { query, limit = 10 } = request.params.arguments || {};
       return await handleSearchToolsRequest(query, limit, sessionId, group);
     }
 
     // Special handling for describe_tool (progressive disclosure mode)
-    if (request.params.name === 'describe_tool') {
+    if (!upstreamOwnsMetaName && request.params.name === 'describe_tool') {
       const { toolName } = request.params.arguments || {};
       return await handleDescribeToolRequest(toolName, sessionId, group);
     }
 
     // Special handling for call_tool
-    if (request.params.name === 'call_tool') {
+    if (!upstreamOwnsMetaName && request.params.name === 'call_tool') {
       const { toolName } = request.params.arguments || {};
       if (!toolName) {
         throw new Error('toolName parameter is required');
@@ -4189,11 +4917,20 @@ const handleCallToolRequestImpl = async (request: any, extra: any) => {
       }
 
       setMetricsServer(targetServerInfo.name);
+      while (catalogRefreshes.has(targetServerInfo)) await catalogRefreshes.get(targetServerInfo);
+      if (targetServerInfo.config?.retentionPolicy) {
+        const closing = waitForIdleRuntimeOwner(targetServerInfo, request, extra);
+        if (closing) await closing;
+      }
 
       // If the target is an on-demand server that is not yet running, wake it up now.
       // Concurrent callers are serialised via ensureServerReady's singleton promise.
       releaseOnDemandToolCall = beginOnDemandToolCall(targetServerInfo);
-      if (targetServerInfo.config?.startOnDemand && targetServerInfo.status !== 'connected') {
+      if (
+        targetServerInfo.config?.startOnDemand &&
+        !targetServerInfo.config.retentionPolicy &&
+        targetServerInfo.status !== 'connected'
+      ) {
         await ensureServerReady(targetServerInfo);
         // Re-read status from the mutated serverInfo after async spawn
         const freshStatus = (targetServerInfo as ServerInfo).status;
@@ -4432,12 +5169,21 @@ const handleCallToolRequestImpl = async (request: any, extra: any) => {
     }
     assertToolAvailableForRoute(tool, appsRouteContext);
     setMetricsServer(serverInfo.name);
+    while (catalogRefreshes.has(serverInfo)) await catalogRefreshes.get(serverInfo);
+    if (serverInfo.config?.retentionPolicy) {
+      const closing = waitForIdleRuntimeOwner(serverInfo, request, extra);
+      if (closing) await closing;
+    }
 
     // Wake the on-demand server before invoking the tool. It may be asleep with
     // a cached tool list (visible above) but no live client. Mirrors the
     // $smart call_tool path. See #1029.
     releaseOnDemandToolCall = beginOnDemandToolCall(serverInfo);
-    if (serverInfo.config?.startOnDemand && serverInfo.status !== 'connected') {
+    if (
+      serverInfo.config?.startOnDemand &&
+      !serverInfo.config.retentionPolicy &&
+      serverInfo.status !== 'connected'
+    ) {
       await ensureServerReady(serverInfo);
     }
     serverInfo.lastUsedAt = Date.now();
@@ -4667,12 +5413,14 @@ const handleCallToolRequestImpl = async (request: any, extra: any) => {
       isError: true,
     };
   } finally {
+    runtimeOwnerLease?.release();
     clientStateLease?.release();
     releaseOnDemandToolCall?.();
   }
 };
 
 const handleGetPromptRequestImpl = async (request: any, extra: any) => {
+  let releaseOperation: (() => void) | undefined;
   try {
     const { name, arguments: promptArgs } = request.params;
     const group = getMcpRequestGroup(extra);
@@ -4712,7 +5460,7 @@ const handleGetPromptRequestImpl = async (request: any, extra: any) => {
       // Find the first server that has this prompt
       server = getVisibleServerInfos().find(
         (serverInfo) =>
-          serverInfo.status === 'connected' &&
+          canServeToolRequests(serverInfo) &&
           serverInfo.enabled !== false &&
           serverInfo.prompts.find((prompt) => prompt.name === name),
       );
@@ -4740,7 +5488,9 @@ const handleGetPromptRequestImpl = async (request: any, extra: any) => {
       name: cleanPromptName || '',
       arguments: summarizeArgumentsForLogging(promptArgs),
     });
-    const prompt = await server.client?.getPrompt(promptParams);
+    const operation = await acquireOperationClient(server, request, extra);
+    releaseOperation = operation.release;
+    const prompt = await operation.client.getPrompt(promptParams);
     logger.log('Received prompt', summarizePromptForLogging(prompt));
     if (!prompt) {
       throw new Error(`Prompt not found: ${cleanPromptName}`);
@@ -4767,12 +5517,15 @@ const handleGetPromptRequestImpl = async (request: any, extra: any) => {
       ],
       isError: true,
     };
+  } finally {
+    releaseOperation?.();
   }
 };
 
 const handleListPromptsRequestImpl = async (_: any, extra: any) => {
   const group = getMcpRequestGroup(extra);
   const lookupGroup = getGroupLookupName(group);
+  const route = await getMcpAppsRouteContext(extra.sessionId || '', group);
   logger.log(`Handling ListPromptsRequest for group: ${group}`);
 
   // Start with built-in prompts (only enabled ones)
@@ -4799,7 +5552,9 @@ const handleListPromptsRequestImpl = async (_: any, extra: any) => {
       let enabledPrompts = serverInfo.prompts;
       if (serverConfig && serverConfig.prompts) {
         enabledPrompts = serverInfo.prompts.filter((prompt: any) => {
-          const promptConfig = serverConfig.prompts?.[prompt.name];
+          const promptConfig =
+            serverConfig.prompts?.[prompt.name] ??
+            serverConfig.prompts?.[normalizePromptNameForGroup(serverInfo.name, prompt.name)];
           // If prompt is not in config, it's enabled by default
           return promptConfig?.enabled !== false;
         });
@@ -4814,10 +5569,14 @@ const handleListPromptsRequestImpl = async (_: any, extra: any) => {
 
       // Apply custom descriptions from server configuration
       const promptsWithCustomDescriptions = enabledPrompts.map((prompt: any) => {
-        const promptConfig = serverConfig?.prompts?.[prompt.name];
+        const promptConfig =
+          serverConfig?.prompts?.[prompt.name] ??
+          serverConfig?.prompts?.[normalizePromptNameForGroup(serverInfo.name, prompt.name)];
         return normalizePromptForList({
           ...prompt,
-          name: projectNameForGroup(prompt.name, serverInfo.name, groupServerConfig),
+          name: route.directServerRoute
+            ? normalizePromptNameForGroup(serverInfo.name, prompt.name)
+            : projectNameForGroup(prompt.name, serverInfo.name, groupServerConfig),
           description: promptConfig?.description || prompt.description, // Use custom description if available
         });
       });
@@ -4893,28 +5652,37 @@ const handleListResourcesRequestImpl = async (_: any, extra: any) => {
   };
 };
 
-const handleListResourceTemplatesRequestImpl = async (_: any, extra: any) => {
+const handleListResourceTemplatesRequestImpl = async (request: any, extra: any) => {
   const sessionId = extra.sessionId || '';
   const group = getMcpRequestGroup(extra);
   const lookupGroup = getGroupLookupName(group);
   logger.log(`Handling ListResourceTemplatesRequest for group: ${group}`);
   const appsRouteContext = await getMcpAppsRouteContext(sessionId, group);
 
-  const { filteredServerInfos, serverConfigsByName } = await getFilteredServerInfosForGroup(
-    lookupGroup,
-    {
-      requireClient: true,
-    },
-  );
+  const { filteredServerInfos, serverConfigsByName } =
+    await getFilteredServerInfosForGroup(lookupGroup);
 
   const snapshots: object[] = [];
   const results = await Promise.allSettled(
     filteredServerInfos.map(async (serverInfo) => {
-      if (!serverInfo.client?.listResourceTemplates) {
+      const catalog = persistentCatalogs.get(serverInfo)?.catalog ?? memoryCatalogs.get(serverInfo);
+      const cachedOnly =
+        serverInfo.config?.catalogMode === 'persistent' || !!serverInfo.config?.retentionPolicy;
+      if (!cachedOnly && !serverInfo.client) return [];
+      if (!cachedOnly && !serverInfo.client?.listResourceTemplates) {
         return [];
       }
 
-      const templates = await serverInfo.client.listResourceTemplates({}, serverInfo.options || {});
+      let templates;
+      if (cachedOnly) templates = { resourceTemplates: catalog?.resourceTemplates ?? [] };
+      else {
+        const operation = await acquireOperationClient(serverInfo, request, extra);
+        try {
+          templates = await operation.client.listResourceTemplates({}, serverInfo.options || {});
+        } finally {
+          operation.release();
+        }
+      }
       snapshots.push(templates.resourceTemplates);
       const filteredTemplates = await filterResourceTemplatesByGroup(
         lookupGroup,
@@ -4967,7 +5735,7 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
 
     let server: ServerInfo | undefined;
     for (const serverInfo of filteredServerInfos) {
-      if (serverInfo.status !== 'connected') {
+      if (!canServeToolRequests(serverInfo)) {
         continue;
       }
       const serverConfig = await getServerDao().findById(serverInfo.name);
@@ -4983,7 +5751,12 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
         enabledResources,
         serverConfigsByName.get(serverInfo.name),
       );
-      if (enabledResources.some((resource) => resource.uri === uri)) {
+      const directResource =
+        appsRouteContext.directServerRoute &&
+        appsRouteContext.serverInfo === serverInfo &&
+        !uri.startsWith('ui://') &&
+        serverConfig?.resources?.[uri]?.enabled !== false;
+      if (enabledResources.some((resource) => resource.uri === uri) || directResource) {
         server = serverInfo;
         break;
       }
@@ -4996,16 +5769,19 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
       ? { cacheMode: 'bypass' as const }
       : undefined;
 
-    if (server?.client) {
+    if (server && (server.client || server.config?.startOnDemand)) {
       // A widget URI the upstream also lists in resources/list is read here, not in
       // the fallback loop below, so it needs the same idle guard: otherwise an
       // idle timer armed by an earlier read can close an on-demand upstream while
       // this read is still in flight.
-      const releaseOnDemandRead = beginOnDemandToolCall(server);
+      let releaseOnDemandRead: (() => void) | undefined;
       try {
+        const operation = await acquireOperationClient(server, request, extra);
+        const client = operation.client;
+        releaseOnDemandRead = operation.release;
         result = readOptions
-          ? await server.client.readResource({ uri }, readOptions)
-          : await server.client.readResource({ uri });
+          ? await client.readResource({ uri }, readOptions)
+          : await client.readResource({ uri });
       } finally {
         releaseOnDemandRead?.();
       }
@@ -5024,6 +5800,19 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
         : (appsRouteContext.serverInfos ?? []);
 
       for (const candidate of candidates) {
+        const config = await getServerDao().findById(candidate.name);
+        if (
+          config?.resources?.[uri]?.enabled === false ||
+          !(
+            await filterResourcesByGroup(
+              lookupGroup,
+              candidate.name,
+              [{ uri }],
+              serverConfigsByName.get(candidate.name),
+            )
+          ).length
+        )
+          continue;
         // An on-demand candidate may be idle yet still advertise its cached widget
         // link, so a host can read the ui:// resource before any tool call has
         // woken it. Hold off its idle shutdown for every read, awake or not, so an
@@ -5031,19 +5820,12 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
         // then wake it the same way the call path does if it is not running.
         let releaseOnDemandRead: (() => void) | undefined;
         try {
-          if (candidate.config?.startOnDemand && candidate.enabled !== false) {
-            releaseOnDemandRead = beginOnDemandToolCall(candidate);
-            if (!candidate.client) {
-              await ensureServerReady(candidate);
-            }
-            candidate.lastUsedAt = Date.now();
-          }
-          if (!candidate.client) {
-            continue;
-          }
+          const operation = await acquireOperationClient(candidate, request, extra);
+          const client = operation.client;
+          releaseOnDemandRead = operation.release;
           const candidateResult = readOptions
-            ? await candidate.client.readResource({ uri }, readOptions)
-            : await candidate.client.readResource({ uri });
+            ? await client.readResource({ uri }, readOptions)
+            : await client.readResource({ uri });
           if (candidateResult && Array.isArray(candidateResult.contents)) {
             result = candidateResult;
             break;
@@ -5239,6 +6021,16 @@ type McpHandler = (request: any, extra: any) => Promise<any>;
 const withPrincipalServers =
   (handler: McpHandler, operation: 'list' | 'tool' | 'prompt' | 'resource'): McpHandler =>
   async (request, extra) => {
+    if (serverInfos.some((info) => info.config?.retentionPolicy) || retentionConfigurations.size)
+      await validateRuntimeRetentionConfigurations();
+    if (serverInfos.some((info) => info.config?.catalogMode === 'persistent'))
+      await validatePersistentCatalogs();
+    if (
+      operation === 'tool' &&
+      CONTROL_TOOL_NAMES.has(request.params?.name) &&
+      (await getControlServers(getMcpRequestGroup(extra))).length
+    )
+      return handleControlTool(request, extra);
     if (!serverInfos.some((info) => hasPersonalAuthentication(info.config)))
       return handler(request, extra);
     // Built-in content does not require an upstream credential.
@@ -5252,9 +6044,13 @@ const withPrincipalServers =
     const group = getMcpRequestGroup(extra);
     const { filteredServerInfos: candidates, serverConfigsByName } =
       await getFilteredServerInfosForGroup(getGroupLookupName(group));
-    const requestedName = ['call_tool', 'describe_tool'].includes(request?.params?.name)
-      ? request.params.arguments?.toolName
-      : request?.params?.name;
+    const directRoute = !!group && !isSmartRoutingGroup(group) && !(await findRouteGroup(group));
+    const upstreamOwnsMetaName =
+      directRoute && candidates.some((info) => findToolOnServer(info, request?.params?.name, true));
+    const requestedName =
+      !upstreamOwnsMetaName && ['call_tool', 'describe_tool'].includes(request?.params?.name)
+        ? request.params.arguments?.toolName
+        : request?.params?.name;
     // An explicit REST target takes precedence over every qualified-name prefix.
     // Otherwise prefer the longest exposed prefix, including group aliases.
     let target = extra?.server ? candidates.find((info) => info.name === extra.server) : undefined;
@@ -5334,7 +6130,7 @@ const withPrincipalServers =
         const prefix = `${extra.server}${getNameSeparator()}`;
         if (typeof requestedName === 'string' && !requestedName.startsWith(prefix)) {
           resolvedRequest =
-            request.params.name === 'call_tool'
+            !upstreamOwnsMetaName && request.params.name === 'call_tool'
               ? {
                   ...request,
                   params: {

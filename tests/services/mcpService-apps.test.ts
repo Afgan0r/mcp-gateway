@@ -579,7 +579,7 @@ describe('mcpService MCP Apps transparent proxy', () => {
 
     expect(result.tools).toEqual([
       expect.objectContaining({
-        name: 'apps-server::open-dashboard',
+        name: 'open-dashboard',
         title: 'Open dashboard',
         outputSchema: { type: 'object' },
         annotations: { readOnlyHint: true },
@@ -605,7 +605,7 @@ describe('mcpService MCP Apps transparent proxy', () => {
     expect(enabled.tools.map((tool) => tool.name)).toEqual(['open-dashboard', 'poll-dashboard']);
 
     const disabled = await run({});
-    expect(disabled.tools.map((tool) => tool.name)).toEqual(['apps-server::open-dashboard']);
+    expect(disabled.tools.map((tool) => tool.name)).toEqual(['open-dashboard']);
   });
 
   it('passes complete Apps metadata and raw tool names on an eligible single-upstream route', async () => {
@@ -1144,7 +1144,7 @@ describe('mcpService MCP Apps transparent proxy', () => {
     );
   });
 
-  it('does not read a listed resource through a different single-server route', async () => {
+  it('forwards an unknown URI only to the explicitly selected direct server', async () => {
     mockFindAll.mockResolvedValue([
       makeServerConfig('apps-server'),
       makeServerConfig('other-server'),
@@ -1161,8 +1161,8 @@ describe('mcpService MCP Apps transparent proxy', () => {
       { sessionId: 'other-session' },
     );
 
-    expect(result.contents[0].text).toContain('Resource not found');
-    expect(mockClient.readResource).not.toHaveBeenCalled();
+    expect(result.contents[0].text).toBe('<html></html>');
+    expect(mockClient.readResource).toHaveBeenCalledWith({ uri: 'resource://apps/private' });
   });
 
   it('updates the cache when an upstream tools list changed callback fires', async () => {

@@ -449,6 +449,7 @@ export interface ServerConfig {
   command?: string; // Command to execute for stdio-based servers
   args?: string[]; // Arguments for the command
   env?: Record<string, string>; // Environment variables
+  inheritEnv?: boolean; // False limits child inheritance to safe OS variables and explicit env bindings.
   headers?: Record<string, string>; // HTTP headers for SSE/streamable-http/openapi servers
   passthroughHeaders?: string[]; // Header names to pass through from MCP requests to upstream SSE/streamable-http servers
   enabled?: boolean; // Flag to enable/disable the server
@@ -544,6 +545,8 @@ export interface ServerConfig {
   // This reduces persistent memory usage for rarely-used servers.
   // Only effective for stdio-type servers; HTTP/SSE servers are unaffected.
   startOnDemand?: boolean; // When true, skip startup connect and spawn lazily on first tool call
+  catalogMode?: 'persistent'; // Shared stdio only; discovery requires explicit catalog bootstrap.
+  retentionPolicy?: 'idle' | 'explicit'; // Shared stdio owner isolation; idle defaults to 15 minutes.
   idleTimeoutMs?: number; // Milliseconds of inactivity before shutting down (default: 300_000 = 5 min)
   // OpenAPI specific configuration
   openapi?: {
