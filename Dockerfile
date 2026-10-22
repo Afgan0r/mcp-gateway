@@ -42,7 +42,10 @@ RUN uv tool install mcp-server-fetch
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs ./
-RUN corepack enable && corepack install && pnpm --version
+COPY scripts/bootstrap-pnpm.mjs ./scripts/bootstrap-pnpm.mjs
+ENV PNPM_HOME=/opt/pnpm
+ENV PATH="${PNPM_HOME}/bin:${PATH}"
+RUN node scripts/bootstrap-pnpm.mjs
 COPY patches ./patches
 RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
   pnpm config set store-dir /pnpm/store && pnpm fetch --frozen-lockfile

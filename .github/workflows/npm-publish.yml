@@ -21,8 +21,12 @@ jobs:
           node-version: 24.16.0
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Setup pnpm
-        run: corepack enable && corepack install && pnpm --version
+      - name: Install pinned pnpm
+        env:
+          PNPM_HOME: ${{ runner.temp }}/pnpm
+        run: |
+          node scripts/bootstrap-pnpm.mjs
+          echo "$PNPM_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Get pnpm store directory
         id: pnpm-cache

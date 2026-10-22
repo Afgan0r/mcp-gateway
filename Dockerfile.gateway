@@ -3,7 +3,10 @@
 FROM node:24.16.0-bookworm-slim AS manifests
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs ./
-RUN corepack enable && corepack install && pnpm --version
+COPY scripts/bootstrap-pnpm.mjs ./scripts/bootstrap-pnpm.mjs
+ENV PNPM_HOME=/opt/pnpm
+ENV PATH="${PNPM_HOME}/bin:${PATH}"
+RUN node scripts/bootstrap-pnpm.mjs
 COPY patches ./patches
 
 FROM manifests AS dependencies
