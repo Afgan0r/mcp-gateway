@@ -63,6 +63,9 @@
     "system": "Système"
   },
   "auth": {
+    "createAccount": "Créer un compte",
+    "backToLogin": "Retour à la connexion",
+    "userAlreadyExists": "Ce nom d’utilisateur existe déjà",
     "login": "Connexion",
     "loginTitle": "Se connecter à MCPHub",
     "slogan": "Passerelle et plan de contrôle MCP open source et auto-hébergés",
@@ -168,6 +171,7 @@
     "noMatchingShareUsers": "Aucun utilisateur ne correspond à votre recherche.",
     "command": "Commande",
     "packageVersion": "Version du paquet installé (dernière installée dans le cache du runner)",
+    "reportedVersion": "Version déclarée par le serveur",
     "updateAvailable": "Une version plus récente est disponible sur le registre",
     "arguments": "Arguments",
     "addArgument": "Ajouter un argument",
@@ -764,6 +768,10 @@
     "descriptionUpdateFailed": "Échec de la mise à jour de la description de l'outil",
     "descriptionModifiedBadge": "Modifiée",
     "defaultDescriptionLabel": "Description par défaut",
+    "visibleParams": "Paramètres visibles par les modèles",
+    "visibleParamsHelp": "Les paramètres décochés sont retirés du schéma reçu par les modèles et ignorés dans leurs appels. Les paramètres obligatoires (*) ne peuvent pas être masqués.",
+    "requiredParam": "Les paramètres obligatoires ne peuvent pas être masqués",
+    "hiddenParamsFailed": "Échec de la mise à jour des paramètres masqués",
     "defaultDescriptionTooltip": "Description par défaut : {{description}}",
     "restoreDefault": "Restaurer par défaut",
     "restoreDefaultSuccess": "La description de l'outil a été restaurée à sa valeur par défaut",
@@ -801,6 +809,8 @@
     "restoreDefaultFailed": "Échec de la restauration de la description par défaut de l'invite"
   },
   "settings": {
+    "allowRegistration": "Autoriser les inscriptions",
+    "allowRegistrationDescription": "Permet aux visiteurs de créer un compte standard depuis la page de connexion. Désactivé par défaut et indisponible si la connexion par mot de passe est désactivée.",
     "allowedCidrs": "Plages CIDR autorisées pour les services en amont",
     "allowedCidrsDescription": "Un CIDR IPv4 ou IPv6 par ligne. Tous les utilisateurs peuvent accéder aux services MCP, OpenAPI et OAuth de ces plages. Une liste vide ne donne aucun accès supplémentaire. Les serveurs appartenant aux administrateurs gardent leur accès interne. Évitez les plages larges et les adresses de métadonnées ou de boucle locale. Les changements concernent les nouvelles requêtes, sans fermer les connexions existantes.",
     "allowedCidrsUpdateFailed": "Échec de la mise à jour des plages CIDR",

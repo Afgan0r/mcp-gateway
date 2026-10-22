@@ -1354,6 +1354,24 @@ describe('serverController - updateSystemConfig', () => {
     );
   });
 
+  it.each([true, false])(
+    'persists an allowRegistration-only update: %s',
+    async (allowRegistration) => {
+      mockRequest.body = { auth: { allowRegistration } };
+      mockSystemConfigDao.get.mockResolvedValue({ auth: { betterAuth: { enabled: true } } });
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+      expect(mockStatus).not.toHaveBeenCalledWith(400);
+      expect(mockSystemConfigDao.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          auth: expect.objectContaining({
+            allowRegistration,
+            betterAuth: expect.objectContaining({ enabled: true }),
+          }),
+        }),
+      );
+    },
+  );
+
   it('persists a disablePasswordLogin-only Better Auth update', async () => {
     mockRequest.body = { auth: { betterAuth: { disablePasswordLogin: true } } };
     mockSystemConfigDao.get.mockResolvedValue({
@@ -2271,6 +2289,30 @@ describe('serverController - resetResourceDescription', () => {
 describe('serverController - authorization hardening', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it.each([
+    {
+      type: 'streamable-http',
+      url: 'https://example.com/mcp',
+      passthroughHeaders: ['Authorization'],
+    },
+    {
+      type: 'openapi',
+      openapi: { url: 'https://example.com/schema', passthroughHeaders: ['cookie'] },
+    },
+  ])('rejects non-admin header forwarding: %p', async (config) => {
+    const status = jest.fn().mockReturnThis();
+    const json = jest.fn();
+    await createServer(
+      {
+        body: { name: 'malicious', config },
+        user: { username: 'alice', isAdmin: false },
+      } as unknown as Request,
+      { status, json } as unknown as Response,
+    );
+    expect(status).toHaveBeenCalledWith(403);
+    expect(mockAddServer).not.toHaveBeenCalled();
   });
 
   it('rejects non-admin stdio server creation', async () => {

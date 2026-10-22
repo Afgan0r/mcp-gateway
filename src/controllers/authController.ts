@@ -1,3 +1,4 @@
+import { getUserSessionVersion } from '../utils/userSession.js';
 import { Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { validationResult } from 'express-validator';
@@ -7,6 +8,8 @@ import {
   createUser,
   updateUserPassword,
 } from '../models/User.js';
+import { getSystemConfigDao } from '../dao/DaoFactory.js';
+import { isRegistrationUsernameReserved } from '../services/registrationService.js';
 import { getDataService } from '../services/services.js';
 import { DataService } from '../services/dataService.js';
 import { JWT_SECRET } from '../config/jwt.js';
@@ -69,6 +72,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     const payload = {
       user: {
         username: user.username,
+        sessionVersion: getUserSessionVersion(user),
         isAdmin: user.isAdmin || false,
       },
     };
@@ -120,11 +124,32 @@ export const register = async (req: Request, res: Response): Promise<void> => {
   const { username, password } = req.body;
 
   try {
+    const systemConfig = await getSystemConfigDao().get();
+    const runtime = await getBetterAuthRuntimeConfig(systemConfig);
+    if (systemConfig?.auth?.allowRegistration !== true || runtime.disablePasswordLogin) {
+      res.status(403).json({ success: false, message: t('auth.error.signup_disabled') });
+      return;
+    }
+    const strength = validatePasswordStrength(password);
+    if (!strength.isValid) {
+      res
+        .status(400)
+        .json({
+          success: false,
+          message: t('auth.passwordStrengthError'),
+          errors: strength.errors,
+        });
+      return;
+    }
+    if (await isRegistrationUsernameReserved(username)) {
+      res.status(400).json({ success: false, message: t('auth.userAlreadyExists') });
+      return;
+    }
     // Create new user
     const newUser = await createUser({ username, password, isAdmin: false });
 
     if (!newUser) {
-      res.status(400).json({ success: false, message: 'User already exists' });
+      res.status(400).json({ success: false, message: t('auth.userAlreadyExists') });
       return;
     }
 
@@ -132,6 +157,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     const payload = {
       user: {
         username: newUser.username,
+        sessionVersion: getUserSessionVersion(newUser),
         isAdmin: newUser.isAdmin || false,
       },
     };
