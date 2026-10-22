@@ -1,4 +1,5 @@
 import { McpSettings, ServerConfig, SystemConfig, IGroup, IUser } from '../../src/types/index.js';
+import path from 'node:path';
 
 /**
  * Creates mock MCP settings for testing
@@ -9,8 +10,8 @@ export const createMockSettings = (overrides: Partial<McpSettings> = {}): McpSet
   const defaultSettings: McpSettings = {
     mcpServers: {
       'test-server-1': {
-        command: 'npx',
-        args: ['-y', 'time-mcp'],
+        command: process.execPath,
+        args: [path.resolve('tests/fixtures/transport-server.mjs')],
         env: {},
         enabled: true,
         keepAliveInterval: 30000,

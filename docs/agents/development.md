@@ -1,6 +1,7 @@
 # Development workflow and troubleshooting
 
-Use the commands defined in `package.json`; the following are the repository's canonical development and validation commands.
+Use the commands defined in `package.json`; the following are the repository's
+canonical development and validation commands.
 
 ## Commands
 
@@ -19,23 +20,34 @@ Use the commands defined in `package.json`; the following are the repository's c
 | Validate docs | `pnpm docs:validate` |
 | Start production build | `pnpm start` |
 
-The backend listens on `:3000` unless `PORT` is set. The frontend dev server listens on `:5173` and proxies API and MCP requests to the backend.
+The backend listens on `:3000` unless `PORT` is set. The frontend dev server
+listens on `:5173` and proxies API and MCP requests to the backend.
 
 ## Validation by change
 
-- For backend startup or MCP wiring changes, run `pnpm dev`, call `GET /health`, and inspect logs for successful upstream connections.
-- For frontend changes, run `pnpm frontend:dev` and exercise the affected path in the browser; automated tests do not replace UX verification.
-- For changes under `docs/`, run `pnpm docs:validate`. The Mintlify check parses only the paths a commit touches, so a page broken by an earlier commit stays invisible until that page is edited again; this compiles every page and reports the same `file:line:column`.
-- MCP servers that require missing API keys may fail to connect locally; distinguish that expected environment failure from an MCPHub regression.
-- The pre-commit validation gate is `pnpm lint && pnpm test:ci && pnpm build`. Fix failures instead of bypassing hooks with `--no-verify`.
+- For backend startup or MCP wiring changes, run `pnpm dev`, call `GET /health`,
+  and inspect logs for successful upstream connections.
+- For frontend changes, run `pnpm frontend:dev` and exercise the affected path
+  in the browser; automated tests do not replace UX verification.
+- For changes under `docs/`, run `pnpm docs:validate`. The Mintlify check parses
+  only the paths a commit touches, so a page broken by an earlier commit stays
+  invisible until that page is edited again; this compiles every page and
+  reports the same `file:line:column`.
+- MCP servers that require missing API keys may fail to connect locally;
+  distinguish that expected environment failure from an MCPHub regression.
+- The pre-commit validation gate is `pnpm lint && pnpm test:ci && pnpm build`.
+  Fix failures instead of bypassing hooks with `--no-verify`.
 
 ## Troubleshooting
 
-- If an MCP server fails to start, validate `mcp_settings.json` and confirm its `command` and `args` resolve on `PATH`.
+- If an MCP server fails to start, validate `mcp_settings.json` and confirm its
+  `command` and `args` resolve on `PATH`.
 - Python-based default servers may require `uvx` on `PATH`.
-- If the frontend is missing in production, run `pnpm frontend:build` before starting the backend.
+- If the frontend is missing in production, run `pnpm frontend:build` before
+  starting the backend.
 - Use `pnpm backend:build` for the full TypeScript error output.
-- For a port conflict, change `PORT` or identify and stop the process holding the port.
+- For a port conflict, change `PORT` or identify and stop the process holding
+  the port.
 
 ## Agent shell `PATH`
 
@@ -77,11 +89,10 @@ user's own terminal can fail here purely because of the sandbox:
 - Any other tool that writes a cache under the user's home (`uvx`, pip, …)
   is subject to the same restriction.
 
-This breaks `pnpm test` runs when a suite spawns a real MCP server via `npx`:
-`tests/integration/sse-service-real-client.test.ts` uses `npx -y time-mcp`
-(see `tests/utils/mockSettings.ts`), so the upstream never starts and the
-suite's `beforeAll` hooks time out (60s), even though the identical run
-passes in the user's terminal.
+An upstream launched through `npx` can fail before MCP initialization when its
+package cache is inaccessible. The real-client transport suite uses the local
+`tests/fixtures/transport-server.mjs` through `tests/utils/mockSettings.ts`, so
+its real stdio upstream does not require a package download during the test.
 
 Workarounds, in order of preference:
 
@@ -90,4 +101,5 @@ Workarounds, in order of preference:
    delete the cache directory afterwards.
 2. Request a wider sandbox permission for the run.
 
-The supported Node.js range is `>=20.0.0`; CI tests Node 20.x and 22.x; the published Docker image uses Node 22.
+The supported Node.js range is `>=20.0.0`; CI tests Node 20.x and 22.x; the
+published Docker image uses Node 22.
