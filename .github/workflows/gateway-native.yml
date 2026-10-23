@@ -1,0 +1,118 @@
+name: Gateway native Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize publication, including manual runs; stale revisions fail the remote
+# head check. Do not cancel a run during replacement of the latest asset.
+concurrency:
+  group: gateway-native-main
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    if: github.repository == 'Afgan0r/mcp-gateway' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.14.0
+      - name: Build verified self-contained Windows x64 package
+        run: node scripts/build-gateway-native.mjs
+      - name: Verify publication provenance and tamper rejection
+        shell: pwsh
+        run: ./scripts/test-gateway-native-release.ps1
+      - name: Exercise the extracted package with its bundled Node
+        shell: pwsh
+        run: ./scripts/verify-gateway-native.ps1 -ArtifactZip "$env:LOCALAPPDATA/mcp-gateway/native-build/mcp-gateway-windows-x64.zip" -DirectEgress
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gateway-native-windows-x64
+          path: |
+            ~/AppData/Local/mcp-gateway/native-build/mcp-gateway-windows-x64.zip
+            ~/AppData/Local/mcp-gateway/native-build/mcp-gateway-windows-x64.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [build, ci]
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: gateway-native-windows-x64
+          path: native-artifacts
+      - name: Publish verified current main as native latest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Assert-CurrentMain {
+            $current = gh api "repos/$env:GH_REPO/git/ref/heads/main" --jq '.object.sha'
+            if ($LASTEXITCODE -ne 0 -or $current -ne $env:SOURCE_SHA) { throw 'Refusing to publish a stale main revision' }
+          }
+          Assert-CurrentMain
+          $zip = 'native-artifacts/mcp-gateway-windows-x64.zip'
+          $hash = ./scripts/verify-gateway-native-release.ps1 -ArtifactZip $zip -SourceRevision $env:SOURCE_SHA
+          $base = gh api "repos/$env:GH_REPO/commits/$env:SOURCE_SHA" --jq '.parents[0].sha'
+          if ($LASTEXITCODE -ne 0 -or $base -notmatch '^[a-f0-9]{40}$') { throw 'Cannot resolve changelog base' }
+          $pulls = gh api "repos/$env:GH_REPO/commits/$env:SOURCE_SHA/pulls" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve source pull requests' }
+          $notes = @(
+            '## Summary', '',
+            "Verified self-contained Windows x64 MCP gateway from $env:SOURCE_SHA, including Node.js 24.16.0 and native dependencies. Archive SHA-256: $hash.", '',
+            '## 摘要', '',
+            '经过验证的 Windows x64 MCP 网关独立发行包，包含 Node.js 24.16.0 和原生依赖。源代码版本和归档校验值见英文摘要。', '',
+            '## References', ''
+          )
+          foreach ($pull in @($pulls | Where-Object merged_at)) {
+            $title = $pull.title -replace '[\r\n]+', ' '
+            $notes += "- $title by @$($pull.user.login) in $($pull.html_url)"
+          }
+          $notes += "- Full changelog: https://github.com/$env:GH_REPO/compare/$base...$env:SOURCE_SHA"
+          $notesPath = Join-Path $env:RUNNER_TEMP 'gateway-native-release-notes.md'
+          [IO.File]::WriteAllText($notesPath, ($notes -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+          node scripts/validate-release-notes.js $notesPath
+          if ($LASTEXITCODE -ne 0) { throw 'Native release notes failed validation' }
+          gh release view gateway-native-latest *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create gateway-native-latest --target $env:SOURCE_SHA --title 'Native MCP gateway latest' --notes-file $notesPath --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot create native release' }
+          }
+          Assert-CurrentMain
+          gh release upload gateway-native-latest $zip "$zip.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Native asset upload failed' }
+          # GitHub computes the asset digest. The installer requires this API
+          # metadata as well as the manifest, rather than trusting a name alone.
+          $release = gh api "repos/$env:GH_REPO/releases/tags/gateway-native-latest" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect published asset' }
+          $asset = @($release.assets | Where-Object name -eq 'mcp-gateway-windows-x64.zip')
+          if ($asset.Count -ne 1 -or $asset[0].digest -ne "sha256:$hash") { throw 'GitHub asset digest missing or incorrect' }
+          Assert-CurrentMain
+          gh api --method PATCH "repos/$env:GH_REPO/git/refs/tags/gateway-native-latest" -f "sha=$env:SOURCE_SHA" -F force=true
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot update native release tag' }
+          gh release edit gateway-native-latest --target $env:SOURCE_SHA --title 'Native MCP gateway latest' --notes-file $notesPath --prerelease=false --latest=false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot update native release metadata' }
