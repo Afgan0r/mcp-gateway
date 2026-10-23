@@ -30,8 +30,6 @@ jobs:
         with:
           node-version: 24.16.0
       - uses: pnpm/action-setup@v4
-        with:
-          version: 12.14.0
       - name: Build verified self-contained Windows x64 package
         run: node scripts/build-gateway-native.mjs
       - name: Verify publication provenance and tamper rejection
