@@ -2,6 +2,7 @@
 import 'reflect-metadata';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash, timingSafeEqual } from 'node:crypto';
 
 process.umask(0o077);
 const settingsPath = process.env.MCPHUB_SETTING_PATH;
@@ -89,6 +90,22 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '16mb' }));
 let stopping = false;
+// Shutdown is an operator action, independent of user-scoped MCP credentials.
+// Hash both sides to a fixed length before the constant-time comparison.
+const shutdownKeys = settings.bearerKeys
+  .filter((key) => key.enabled && key.token && (key.kind ?? 'system') === 'system')
+  .map((key) => createHash('sha256').update(key.token).digest());
+app.post('/_gateway/shutdown', (req, res) => {
+  const token = req.headers.authorization?.match(/^Bearer (.+)$/i)?.[1] || '';
+  const supplied = createHash('sha256').update(token).digest();
+  const permitted = shutdownKeys.reduce(
+    (accepted, expected) => timingSafeEqual(supplied, expected) || accepted,
+    false,
+  );
+  if (!token || !permitted) return res.status(401).json({ error: 'Unauthorized' });
+  res.status(202).json({ status: 'stopping' });
+  setImmediate(() => void stop());
+});
 app.get('/health', (_req, res) =>
   res.status(stopping ? 503 : 200).json({
     status: stopping ? 'stopping' : 'ready',
