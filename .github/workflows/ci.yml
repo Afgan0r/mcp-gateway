@@ -52,6 +52,9 @@ jobs:
       - name: Prepare real Docker lifecycle fixture
         run: docker info --format '{{.ServerVersion}}' && docker pull node:24.16.0-bookworm-slim
 
+      - name: Verify versioned gateway publication
+        run: pnpm gateway:release:test
+
       - name: Run tests
         run: pnpm test:ci
 

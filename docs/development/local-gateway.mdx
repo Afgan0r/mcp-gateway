@@ -213,6 +213,16 @@ anonymous pulls; first publication defaults to private visibility, configured
 through [GitHub package settings](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
 (accessed 2026-10-19).
 
+## Versioned Windows releases
+
+`gateway-release.json` owns the gateway version and the matching file under `release-notes/`. Each stable release uses a separate `gateway-native-vX.Y.Z` tag, with its own bilingual description and verified Windows x64 archive. Bump the version and add its release notes before publishing a new source revision; published tags, assets and descriptions are not overwritten.
+
+The native workflow verifies clean source provenance, uploads to a draft, checks both GitHub asset digests and confirms the current `main` revision before publishing the version as latest. A retry can resume a matching draft or leave an already published matching version untouched. Linux continues to publish its verified OCI image through the existing image workflow.
+
+Windows installers resolve GitHub's latest stable release, then pin the concrete version tag and verify the archive. They no longer use the former `gateway-native-latest` tag. GitHub documents the [latest-release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release) and the [draft publication sequence](https://cli.github.com/manual/gh_release_create) (accessed 2026-11-05).
+
+Run `pnpm gateway:release:test` to check versioned publication, repeated publication, draft recovery and rejection of stale source or mismatched assets. These checks also gate the published Windows artifact in CI.
+
 ## Diagnostic verification
 
 The isolated diagnostic below creates only harmless local counter processes. It
