@@ -30,13 +30,10 @@ function github(args, allowMissing = false) {
   const result = spawnSync('gh', args, { encoding: 'utf8', timeout: 120000 });
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    if (allowMissing && /HTTP 404/.test(result.stderr)) return null;
+    if (allowMissing && (/HTTP 404/.test(result.stderr) || /^release not found\s*$/im.test(result.stderr))) return null;
     throw new Error(`GitHub ${args[0]} failed (${result.status}); ${result.stderr.trim().slice(0, 500)}`);
   }
-  if (args[0] !== 'api') return result.stdout;
-  if (args.includes('--paginate')) {
-    return result.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-  }
+  if (args[0] !== 'api' && !args.includes('--json')) return result.stdout;
   return result.stdout.trim() ? JSON.parse(result.stdout) : undefined;
 }
 
@@ -59,12 +56,16 @@ export function publishNativeRelease({ repository, sourceRevision, artifact, sha
   };
   const tagRevision = () => api(`commits/${definition.tag}`).sha;
   currentMain();
-  // Authenticated listings include drafts; releases/tags only finds published releases.
-  const matchingReleases = () => gh(['api', '--paginate', `${endpoint}/releases?per_page=100`,
-    '--jq', `.[] | select(.tag_name == "${definition.tag}") | @json`]);
-  const matches = matchingReleases();
-  assert(matches.length <= 1, 'Gateway version has duplicate releases');
-  let release = matches[0];
+  // The CLI resolves pending drafts as well as published releases.
+  const existing = gh(['release', 'view', definition.tag, '--repo', repository, '--json', 'apiUrl'], true);
+  let release;
+  if (existing) {
+    const prefix = `https://api.github.com/${endpoint}/releases/`;
+    assert(existing.apiUrl.startsWith(prefix), 'Release API URL is outside this repository');
+    const id = existing.apiUrl.slice(prefix.length);
+    assert(/^\d+$/.test(id), 'Invalid release API ID');
+    release = api(`releases/${id}`);
+  }
   const existingTag = api(`git/ref/tags/${definition.tag}`, true);
   if (existingTag) assert.equal(tagRevision(), sourceRevision, 'Release version already belongs to another revision; bump gateway-release.json');
   else {
@@ -91,22 +92,34 @@ export function publishNativeRelease({ repository, sourceRevision, artifact, sha
     try {
       const notes = path.join(temporary, 'notes.md');
       fs.writeFileSync(notes, definition.body);
-      gh(['release', 'create', definition.tag, '--repo', repository, '--target', sourceRevision,
-        '--title', definition.title, '--notes-file', notes, '--draft', '--latest=false']);
+      release = gh(['api', '--method', 'POST', `${endpoint}/releases`,
+        '-f', `tag_name=${definition.tag}`, '-f', `target_commitish=${sourceRevision}`,
+        '-f', `name=${definition.title}`, '-F', `body=@${notes}`,
+        '-F', 'draft=true', '-F', 'prerelease=false', '-f', 'make_latest=false']);
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });
     }
-    const drafts = matchingReleases();
-    assert.equal(drafts.length, 1, 'Created draft cannot be resolved');
-    release = drafts[0];
   }
+  assert(Number.isInteger(release.id) && release.id > 0, 'Created release has no API ID');
+  assert.equal(release.tag_name, definition.tag, 'Resolved release tag differs from this version');
   // Upload replacement is allowed only while this exact version remains a draft.
   release = api(`releases/${release.id}`);
   assert.equal(release.draft, true, 'Release was published concurrently');
   assert.equal(tagRevision(), sourceRevision, 'Release tag changed during publication');
-  gh(['release', 'upload', definition.tag, artifact, checksum, '--repo', repository, '--clobber']);
+  for (const filename of [artifact, checksum]) {
+    const name = path.basename(filename);
+    for (const asset of release.assets.filter((candidate) => candidate.name === name)) {
+      assert(Number.isInteger(asset.id) && asset.id > 0, 'Draft asset has no API ID');
+      gh(['api', '--method', 'DELETE', `${endpoint}/releases/assets/${asset.id}`]);
+    }
+    const uploaded = gh(['api', '--method', 'POST',
+      `https://uploads.github.com/${endpoint}/releases/${release.id}/assets?name=${encodeURIComponent(name)}`,
+      '-H', 'Content-Type: application/octet-stream', '--input', filename]);
+    assert.equal(uploaded.digest, `sha256:${digest(filename)}`, 'GitHub asset digest differs from verified artifact');
+  }
   release = api(`releases/${release.id}`);
   assert.equal(release.draft, true, 'Release was published concurrently');
+  assert.equal(release.assets.length, 2, 'Draft contains unexpected release assets');
   for (const [name, hash] of [[path.basename(artifact), sha256], [path.basename(checksum), digest(checksum)]]) {
     const assets = release.assets.filter((asset) => asset.name === name);
     assert.equal(assets.length, 1, 'Uploaded release asset inventory is incomplete');

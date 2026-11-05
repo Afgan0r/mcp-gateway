@@ -22,32 +22,48 @@ function fixture(t, initial = {}) {
   fs.writeFileSync(`${artifact}.sha256`, `${hash(artifact)}  ${path.basename(artifact)}\n`);
   const state = { head: revision, release: null, tagRevision: null, writes: [], ...initial };
   const gh = (args) => {
+    if (args[0] === 'release' && args[1] === 'view') {
+      return state.release ? { apiUrl: 'https://api.github.com/repos/Afgan0r/mcp-gateway/releases/123' } : null;
+    }
     if (args[0] === 'api' && args[1] !== '--method') {
-      const endpoint = args[1] === '--paginate' ? args[2] : args[1];
+      const endpoint = args[1];
       if (endpoint.endsWith('/git/ref/heads/main')) return { object: { sha: state.head } };
       if (endpoint.endsWith(`/commits/${tag}`)) return { sha: state.tagRevision };
       if (endpoint.endsWith(`/git/ref/tags/${tag}`)) return state.tagRevision ? { object: { sha: state.tagRevision } } : null;
-      if (endpoint.endsWith('/releases?per_page=100')) return [state.release].filter(Boolean).map((release) => structuredClone(release));
       if (endpoint.endsWith('/releases/123') || endpoint.endsWith('/releases/latest')) return structuredClone(state.release);
       throw new Error(`Unrecognized read: ${endpoint}`);
     }
     state.writes.push(args);
-    if (args[0] === 'release' && args[1] === 'create') {
-      assert(args.includes('--draft'));
-      assert(args.includes('--latest=false'));
-      assert.equal(state.tagRevision, revision, 'Version ref must precede draft creation');
-      state.release = { id: 123, tag_name: tag, draft: true, prerelease: false, assets: [] };
-    } else if (args[0] === 'release' && args[1] === 'upload') {
-      assert(state.release.draft, 'Published assets must never be overwritten');
-      state.release.assets = [artifact, `${artifact}.sha256`].map((file) => ({ name: path.basename(file), digest: `sha256:${hash(file)}` }));
-      if (state.corruptUpload) state.release.assets[0].digest = `sha256:${'0'.repeat(64)}`;
-      if (state.moveMain) state.head = 'b'.repeat(40);
-    } else if (args[0] === 'api' && args[1] === '--method') {
-      if (args[2] === 'POST') {
-        assert(args.includes(`ref=refs/tags/${tag}`));
-        assert(args.includes(`sha=${revision}`));
-        state.tagRevision = revision;
+    if (args[0] === 'api' && args[1] === '--method') {
+      if (args[2] === 'DELETE') {
+        assert(state.release.draft, 'Published assets must never be overwritten');
+        state.release.assets = state.release.assets.filter((asset) => !args[3].endsWith(`/${asset.id}`));
         return;
+      }
+      if (args[2] === 'POST') {
+        if (args[3].startsWith('https://uploads.github.com/')) {
+          assert(state.release.draft, 'Published assets must never be overwritten');
+          const file = args[args.indexOf('--input') + 1];
+          const asset = { id: state.release.assets.length + 10, name: path.basename(file), digest: `sha256:${hash(file)}` };
+          if (state.corruptUpload) asset.digest = `sha256:${'0'.repeat(64)}`;
+          state.release.assets.push(asset);
+          if (state.moveMain) state.head = 'b'.repeat(40);
+          return structuredClone(asset);
+        }
+        if (args[3].endsWith('/git/refs')) {
+          assert(args.includes(`ref=refs/tags/${tag}`));
+          assert(args.includes(`sha=${revision}`));
+          state.tagRevision = revision;
+          return;
+        }
+        assert(args[3].endsWith('/releases'));
+        assert(args.includes('draft=true'));
+        assert(args.includes('make_latest=false'));
+        assert.equal(state.tagRevision, revision, 'Version ref must precede draft creation');
+        const notes = args.find((arg) => arg.startsWith('body=@')).slice('body=@'.length);
+        assert(fs.readFileSync(notes, 'utf8').includes('## Summary'));
+        state.release = { id: 123, tag_name: tag, draft: true, prerelease: false, assets: [] };
+        return structuredClone(state.release);
       }
       assert(args.includes('draft=false'));
       assert(args.includes('make_latest=true'));
@@ -69,7 +85,7 @@ test('publishes a complete draft as the latest stable version', (t) => {
   const { state, publish } = fixture(t);
   assert.deepEqual(publish(), { tag, status: 'published' });
   assert.equal(state.release.draft, false);
-  assert.equal(state.writes.length, 4);
+  assert.equal(state.writes.length, 5);
   assert(!state.writes.some((args) => args.some((value) => value.includes('gateway-native-latest'))));
 });
 test('a repeated publication preserves the original assets and metadata', (t) => {
@@ -85,8 +101,16 @@ test('resumes an interrupted draft without creating another release', (t) => {
   const { state, publish } = fixture(t, { tagRevision: revision,
     release: { id: 123, tag_name: tag, draft: true, prerelease: false, assets: [] } });
   publish();
-  assert.equal(state.writes.length, 2);
+  assert.equal(state.writes.length, 3);
   assert.equal(state.release.draft, false);
+});
+test('replaces incomplete assets only inside a verified draft', (t) => {
+  const { state, publish } = fixture(t, { tagRevision: revision,
+    release: { id: 123, tag_name: tag, draft: true, prerelease: false,
+      assets: [{ id: 7, name: 'mcp-gateway-windows-x64.zip', digest: `sha256:${'0'.repeat(64)}` }] } });
+  publish();
+  assert.equal(state.release.assets.length, 2);
+  assert(state.writes.some((args) => args[2] === 'DELETE'));
 });
 test('resumes an untagged draft only when its exact source is verified', (t) => {
   const { state, publish } = fixture(t, {
