@@ -1,15 +1,13 @@
 name: Gateway image
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Publication is serialized across push and manual runs. A newer main revision
-# cancels the older run; a final remote-head check also rejects stale dispatches.
+# Serialize explicit publication requests. A newer dispatch cancels the older
+# run; the remote-head checks also reject stale main revisions.
 concurrency:
   group: gateway-image-main
   cancel-in-progress: true

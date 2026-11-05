@@ -1,14 +1,12 @@
 name: Gateway native Windows
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Serialize publication, including manual runs; stale revisions fail the remote
+# Serialize explicit publication requests; stale revisions fail the remote
 # head check. Published version tags and assets are never replaced.
 concurrency:
   group: gateway-native-main

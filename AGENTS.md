@@ -1,3 +1,6 @@
+<!-- Repository prose keeps one source line per paragraph. -->
+<!-- markdownlint-disable MD013 -->
+
 # MCPHub — Agent Guide
 
 MCPHub (`@samanhappy/mcphub`) is a TypeScript/Node.js ESM hub that aggregates MCP servers behind a single HTTP service with a React/Vite dashboard.
@@ -7,6 +10,7 @@ MCPHub (`@samanhappy/mcphub`) is a TypeScript/Node.js ESM hub that aggregates MC
 - Use `pnpm` (`pnpm@12.14.0`, declared in `package.json`).
 - Treat the current implementation as the source of truth. If this guide disagrees with the code, follow the code and update the guide; tests document expected behavior and should change only when behavior intentionally changes.
 - Do not hand-edit generated output: `dist/`, `frontend/dist/`, or `coverage/`.
+- At task completion, read and follow [Task completion](docs/agents/git-and-contribution.md#task-completion): commit and push verified task changes automatically, and publish when the delivered package changed. Explicit user restrictions take precedence.
 - Read the scoped guide relevant to the files you will change. The full index is in [docs/agents/README.md](docs/agents/README.md).
 - Prefer the `gh` CLI for GitHub operations — reviewing PRs, reading issues, fetching diffs, creating PRs — over scraping the GitHub web UI or hand-calling the REST API. Command details live in [docs/agents/git-and-contribution.md](docs/agents/git-and-contribution.md).
 - The agent shell runs non-interactively with a minimal `PATH`, so bare `gh`, `pnpm`, `node`, and `npx` may report `command not found` even when installed. See [docs/agents/development.md](docs/agents/development.md) ("Agent shell `PATH`") for how to locate and export the toolchain.

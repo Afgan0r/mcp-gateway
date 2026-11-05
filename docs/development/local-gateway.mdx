@@ -217,6 +217,17 @@ through [GitHub package settings](https://docs.github.com/en/packages/learn-gith
 
 `gateway-release.json` owns the gateway version and the matching file under `release-notes/`. Each stable release uses a separate `gateway-native-vX.Y.Z` tag, with its own bilingual description and verified Windows x64 archive. Bump the version and add its release notes before publishing a new source revision; published tags, assets and descriptions are not overwritten.
 
+Publication is explicitly dispatched from `main`, rather than triggered by every push. At task completion, publish when the shipped package changed; documentation, agent instructions and publication-orchestration changes alone do not require a new version. The [agent completion policy](../agents/git-and-contribution.md#task-completion) owns automatic commit/push behavior.
+
+After the final package revision and its new version notes reach `main`, dispatch both delivery workflows:
+
+```sh
+gh workflow run gateway-image.yml --repo Afgan0r/mcp-gateway --ref main
+gh workflow run gateway-native.yml --repo Afgan0r/mcp-gateway --ref main
+```
+
+Record each dispatched run ID and verify that its `headSha` matches the intended main revision. Wait for both runs to succeed, then verify the image source revision and latest native release/tag/assets. If `main` changes before publication, let the stale-source guards stop it and resolve the new revision before retrying. Do not repoint a published version. GitHub documents [manual workflow dispatch](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow) and [CLI dispatch with an explicit ref](https://cli.github.com/manual/gh_workflow_run) (accessed 2026-11-05).
+
 The native workflow verifies clean source provenance, uploads to a draft, checks both GitHub asset digests and confirms the current `main` revision before publishing the version as latest. A retry can resume a matching draft or leave an already published matching version untouched. Linux continues to publish its verified OCI image through the existing image workflow.
 
 Windows installers resolve GitHub's latest stable release, then pin the concrete version tag and verify the archive. They no longer use the former `gateway-native-latest` tag. GitHub documents the [latest-release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release) and the [draft publication sequence](https://cli.github.com/manual/gh_release_create) (accessed 2026-11-05).
