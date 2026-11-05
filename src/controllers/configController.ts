@@ -1,3 +1,4 @@
+import { isHostedModeEnabled } from '../services/hostedMode.js';
 import { Request, Response } from 'express';
 import config from '../config/index.js';
 import { getDataService } from '../services/services.js';
@@ -37,6 +38,7 @@ export const getRuntimeConfig = (req: Request, res: Response): void => {
   try {
     const runtimeConfig = {
       basePath: config.basePath,
+      isHosted: isHostedModeEnabled(),
       smartRoutingPath: config.smartRoutingPath,
       version: config.mcpHubVersion,
       name: config.mcpHubName,
@@ -85,6 +87,7 @@ export const getPublicConfig = async (req: Request, res: Response): Promise<void
     res.json({
       success: true,
       data: {
+        dashboardName: systemConfig?.dashboardName || '',
         skipAuth,
         allowRegistration:
           systemConfig?.auth?.allowRegistration === true &&
@@ -204,7 +207,7 @@ export const getMcpSettingsJson = async (req: Request, res: Response): Promise<v
         userConfigs,
         oauthClients: omitSensitiveFields(oauthClients, ['clientSecret']),
         oauthTokens: omitSensitiveFields(oauthTokens, ['accessToken', 'refreshToken']),
-        bearerKeys: omitSensitiveFields(bearerKeys, ['token']),
+        bearerKeys: omitSensitiveFields(bearerKeys, ['token', 'tokenHash']),
       };
 
       res.json({

@@ -387,6 +387,24 @@ describe('buildServerPayload', () => {
     expect(payload.config.oauth).not.toHaveProperty('revocationEndpoint');
   });
 
+  it('round-trips explicit authorization server metadata through a form save', () => {
+    const authorizationServerMetadata = {
+      issuer: 'https://as.example.com',
+      authorization_endpoint: 'https://as.example.com/authorize',
+      token_endpoint: 'https://as.example.com/token',
+      response_types_supported: ['code'],
+    };
+    const payload = buildServerPayload({
+      formData: buildSseForm({ authorizationServerMetadata,
+        authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com'] } }),
+      serverType: 'sse',
+      envVars: [],
+      headerVars: [],
+    });
+    expect(payload.config.oauth?.authorizationServerMetadata).toEqual(authorizationServerMetadata);
+    expect(payload.config.oauth?.authorizationRelay).toEqual({ allowedRedirectOrigins: ['https://login.example.com'] });
+  });
+
   it('preserves revocationEndpoint, redirectUri and dynamicRegistration together (deep equal)', () => {
     const payload = buildServerPayload({
       formData: buildSseForm({
@@ -486,4 +504,64 @@ test('preserves personal OAuth mode in an HTTP server form payload', () => {
 test('switching a shared OAuth server to personal mode removes shared tokens from the form payload', () => {
   const result = buildServerPayload({ formData: { name: 'gitlab', url: 'https://gitlab.example/mcp', command: '', arguments: '', args: [], env: [], headers: [], oauth: { identityMode: 'personal', accessToken: 'old-shared', refreshToken: 'old-refresh' } }, serverType: 'streamable-http', envVars: [], headerVars: [] });
   expect(result.config.oauth).toEqual({ identityMode: 'personal' });
+});
+
+describe('upstream protocol config in dashboard payloads', () => {
+  it.each(['auto', 'legacy'] as const)(
+    'preserves %s when editing or duplicating HTTP servers',
+    (mode) => {
+      const input = {
+        formData: {
+          name: 'remote',
+          url: 'https://example.com/mcp',
+          command: '',
+          arguments: '',
+          env: [],
+          headers: [],
+          protocolNegotiation: mode,
+        },
+        envVars: [],
+        headerVars: [],
+      };
+      expect(
+        buildServerPayload({ ...input, serverType: 'streamable-http' }).config.protocolNegotiation,
+      ).toBe(mode);
+      expect(
+        buildServerPayload({ ...input, serverType: 'stdio' }).config.protocolNegotiation,
+      ).toBeUndefined();
+    },
+  );
+});
+
+
+it('preserves normalized user-group sharing in server saves', () => {
+  const payload = buildServerPayload({
+    formData: {
+      name: 'shared',
+      url: '',
+      command: 'node',
+      arguments: '',
+      env: [],
+      headers: [],
+      visibility: 'group',
+      sharedWithUserGroups: [' readers ', 'readers'],
+    } as ServerFormData,
+    serverType: 'stdio',
+    envVars: [],
+    headerVars: [],
+  });
+  expect(payload.config).toMatchObject({ sharedWithUserGroups: ['readers'] });
+});
+
+test('preserves shared OAuth expiry when saving the form', () => {
+  const payload = buildServerPayload({
+    formData: {
+      name: 'remote', url: 'https://example.com/mcp', command: '', arguments: '',
+      env: [], headers: [], oauth: { accessToken: 'opaque', accessTokenExpiresAt: 12345 },
+    },
+    serverType: 'streamable-http',
+    envVars: [],
+    headerVars: [],
+  });
+  expect(payload.config.oauth?.accessTokenExpiresAt).toBe(12345);
 });

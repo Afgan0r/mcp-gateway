@@ -37,6 +37,8 @@
   },
   "users": [],
   "systemConfig": {
+    "dashboardName": "",
+    "toolPolicies": [],
     "oauthServer": {
       "enabled": true,
       "accessTokenLifetime": 3600,

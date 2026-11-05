@@ -49,6 +49,7 @@ It works with MCP clients such as Claude Code, Cursor, Cherry Studio, OpenWebUI,
 - **MCP Apps Proxy** - Transparently forward interactive MCP Apps on single-server routes ([Learn more](https://docs.mcphub.app/features/mcp-apps))
 - **Tool Result Compression** - Transparently reduce large text tool outputs before they reach clients
 - **Database Mode** - Store configuration in PostgreSQL for production environments ([Learn more](https://docs.mcphub.app/configuration/database-configuration))
+- **Multiple Replicas** - Share PostgreSQL configuration with explicit session affinity and reconnect boundaries ([Deployment guide](https://docs.mcphub.app/configuration/replicas))
 - **Docker-Ready** - Deploy instantly with containerized setup
 
 ## 🔧 Quick Start
@@ -56,7 +57,7 @@ It works with MCP clients such as Claude Code, Cursor, Cherry Studio, OpenWebUI,
 ### Prerequisites
 
 - **Docker** (recommended) — the fastest way to run MCPHub; all commands below use it
-- **Node.js** `>=20.0.0` and **pnpm** `12.14.0` — only needed to run from source or develop locally (see [Local Development](#local-development))
+- **Node.js** `>=22.0.0` and **pnpm** `12.14.0` — only needed to run from source or develop locally (see [Local Development](#local-development))
 
 ### Start with Docker
 
@@ -101,6 +102,15 @@ Two image variants are published under `samanhappy/mcphub`:
 - **`latest-full`** — the extended image. Adds Rust toolchain (Cargo/rustc), Docker Engine, and Playwright browsers (Chrome + Firefox, amd64 only). Use this for Rust-based servers or container-in-container workflows. Larger download.
 
 See [Docker Setup](https://docs.mcphub.app/configuration/docker-setup) for build options and Docker-in-Docker configuration.
+
+### One-Click Deploy
+
+<a href="https://repocloud.io/details/MCPHub/"><img src="https://d16t0pc4846x52.cloudfront.net/deploylobe.svg" alt="Deploy on RepoCloud" height="42"></a>
+<a href="https://railway.com/deploy/mcphub"><img src="https://railway.com/button.svg" alt="Deploy on Railway" height="42"></a>
+
+### Upgrading deployments with personal credentials
+
+Database mode requires a persistent `MCPHUB_CREDENTIAL_ENCRYPTION_KEY` or an existing key file; it no longer generates a local key automatically. Before replacing a working container, back up its original key and preserve the same value in deployment secrets. A database backup alone cannot recover encrypted credentials if the key is lost. See the [Credential Key Upgrade and Recovery Guide](docs/configuration/credential-key-upgrade.mdx) for working deployments and recovery after a failed upgrade.
 
 ### Access Dashboard
 

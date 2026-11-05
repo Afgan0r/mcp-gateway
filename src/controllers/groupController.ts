@@ -35,6 +35,9 @@ const isValidCapabilitySelection = (value: unknown): boolean => {
   );
 };
 
+const isValidPreserveToolNames = (value: unknown): boolean =>
+  value === undefined || typeof value === 'boolean';
+
 const isValidServerAlias = (value: unknown): boolean => {
   return value === undefined || typeof value === 'string';
 };
@@ -69,6 +72,10 @@ const validateGroupServersConfig = (servers: unknown): string | null => {
 
     if (typeof serverConfig.name !== 'string' || serverConfig.name.length === 0) {
       return 'Server configuration must have a name property';
+    }
+
+    if (!isValidPreserveToolNames(serverConfig.preserveToolNames)) {
+      return 'Server preserveToolNames must be a boolean when provided';
     }
 
     if (!isValidServerAlias(serverConfig.alias)) {
@@ -150,10 +157,18 @@ export const getGroup = async (req: Request, res: Response): Promise<void> => {
 // Create a new group
 export const createNewGroup = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { name, description, instructions, servers, visibility, sharedWithUsers } = req.body;
+    const {
+      name,
+      description,
+      instructions,
+      servers,
+      visibility,
+      sharedWithUsers,
+      sharedWithUserGroups,
+    } = req.body;
     const accessError =
       getSmartRoutingNameError(name) ||
-      validateGroupAccess({ visibility, sharedWithUsers }) ||
+      validateGroupAccess({ visibility, sharedWithUsers, sharedWithUserGroups }) ||
       getInstructionsError(instructions);
     if (accessError) {
       res.status(400).json({ success: false, message: accessError });
@@ -184,6 +199,7 @@ export const createNewGroup = async (req: Request, res: Response): Promise<void>
     const newGroup = await createGroup(name, description, serverList, owner, {
       visibility,
       sharedWithUsers,
+      sharedWithUserGroups,
       instructions,
     });
     if (!newGroup) {
@@ -260,6 +276,13 @@ export const batchCreateGroups = async (req: Request, res: Response): Promise<vo
               };
             }
 
+            if (!isValidPreserveToolNames(server.preserveToolNames)) {
+              return {
+                valid: false,
+                message: 'Server preserveToolNames must be a boolean when provided',
+              };
+            }
+
             if (!isValidServerAlias(server.alias)) {
               return {
                 valid: false,
@@ -299,7 +322,15 @@ export const batchCreateGroups = async (req: Request, res: Response): Promise<vo
     const defaultOwner = currentUser?.username || 'admin';
 
     for (const groupData of groups) {
-      const { name, description, instructions, servers, visibility, sharedWithUsers } = groupData;
+      const {
+        name,
+        description,
+        instructions,
+        servers,
+        visibility,
+        sharedWithUsers,
+        sharedWithUserGroups,
+      } = groupData;
 
       // Validate group configuration
       const accessError =
@@ -322,6 +353,7 @@ export const batchCreateGroups = async (req: Request, res: Response): Promise<vo
         const newGroup = await createGroup(name, description, serverList, defaultOwner, {
           visibility,
           sharedWithUsers,
+          sharedWithUserGroups,
           instructions,
         });
 
@@ -374,10 +406,18 @@ export const batchCreateGroups = async (req: Request, res: Response): Promise<vo
 export const updateExistingGroup = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const { name, description, instructions, servers, visibility, sharedWithUsers } = req.body;
+    const {
+      name,
+      description,
+      instructions,
+      servers,
+      visibility,
+      sharedWithUsers,
+      sharedWithUserGroups,
+    } = req.body;
     const accessError =
       getSmartRoutingNameError(name) ||
-      validateGroupAccess({ visibility, sharedWithUsers }) ||
+      validateGroupAccess({ visibility, sharedWithUsers, sharedWithUserGroups }) ||
       getInstructionsError(instructions);
     if (accessError) {
       res.status(400).json({ success: false, message: accessError });
@@ -394,6 +434,10 @@ export const updateExistingGroup = async (req: Request, res: Response): Promise<
     // Allow updating servers along with other fields
     const updateData: Partial<IGroup> = {};
     if (visibility !== undefined) updateData.visibility = visibility;
+    if (sharedWithUserGroups !== undefined)
+      updateData.sharedWithUserGroups = [
+        ...new Set<string>(sharedWithUserGroups.map((name: string) => name.trim())),
+      ];
     if (sharedWithUsers !== undefined)
       updateData.sharedWithUsers = [
         ...new Set<string>(sharedWithUsers.map((name: string) => name.trim())),
@@ -477,6 +521,16 @@ export const updateGroupServersBatch = async (req: Request, res: Response): Prom
           });
           return;
         }
+        if (!isValidPreserveToolNames(server.preserveToolNames)) {
+          res
+            .status(400)
+            .json({
+              success: false,
+              message: 'Server preserveToolNames must be a boolean when provided',
+            });
+          return;
+        }
+
         if (!isValidServerAlias(server.alias)) {
           res.status(400).json({
             success: false,
@@ -791,6 +845,7 @@ export const getGroupShareCandidates = async (req: Request, res: Response): Prom
     const users = await getUserDao().findAll();
     res.json({
       success: true,
+      userGroups: [...new Set(users.flatMap((user) => user.userGroups ?? []))].sort(),
       data: users
         .map((user) => user.username)
         .filter((username) => username !== group.owner)

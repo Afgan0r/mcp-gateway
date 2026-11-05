@@ -12,7 +12,7 @@ import {
 import { getServerDao, getGroupDao } from '../dao/index.js';
 import type { ServerConfigWithName } from '../dao/ServerDao.js';
 import { isPrivilegedServerConfig } from '../utils/serverConfigValidation.js';
-import { normalizeOAuth } from '../utils/serverConfigPersistence.js';
+import { normalizeServerConfigForPersistence } from '../utils/serverConfigPersistence.js';
 import { validateServerName } from '../utils/serverNameValidation.js';
 import { createGroup } from './groupService.js';
 import { addServer } from './mcpService.js';
@@ -180,6 +180,12 @@ function stripOAuthSecrets(oauth: NonNullable<ServerConfig['oauth']>): {
   const sanitized: TemplateOAuthConfig = {};
   const placeholders: string[] = [];
 
+  if (oauth.identityMode) sanitized.identityMode = oauth.identityMode;
+  if (oauth.authorizationRelay)
+    sanitized.authorizationRelay = structuredClone(oauth.authorizationRelay);
+  if (oauth.authorizationServerMetadata) {
+    sanitized.authorizationServerMetadata = structuredClone(oauth.authorizationServerMetadata);
+  }
   if (oauth.clientId) sanitized.clientId = oauth.clientId;
   if (oauth.allowInsecureTokenEndpoint !== undefined) {
     sanitized.allowInsecureTokenEndpoint = oauth.allowInsecureTokenEndpoint;
@@ -359,6 +365,8 @@ function serverConfigToTemplate(config: ServerConfig): {
   if (config.args) templateConfig.args = [...config.args];
   if (config.passthroughHeaders) templateConfig.passthroughHeaders = [...config.passthroughHeaders];
   if (config.enabled !== undefined) templateConfig.enabled = config.enabled;
+  if (config.protocolNegotiation !== undefined)
+    templateConfig.protocolNegotiation = config.protocolNegotiation;
   if (config.enableKeepAlive !== undefined) templateConfig.enableKeepAlive = config.enableKeepAlive;
   if (config.keepAliveInterval !== undefined) {
     templateConfig.keepAliveInterval = config.keepAliveInterval;
@@ -612,18 +620,19 @@ export async function importTemplate(
         ...config,
         enabled: config.enabled ?? true,
         owner: owner || 'admin',
-        oauth: normalizeOAuth(config.oauth),
       };
       if (requestingUser && !requestingUser.isAdmin && isPrivilegedServerConfig(serverConfig)) {
         throw new Error(
-          serverConfig.oauth?.allowInsecureTokenEndpoint === true
+          serverConfig.oauth?.authorizationRelay
+            ? 'Only admins can import servers using an OAuth authorization relay'
+            : serverConfig.oauth?.allowInsecureTokenEndpoint === true
             ? 'Only admins can import servers allowing HTTP OAuth token endpoints'
             : serverConfig.passthroughHeaders?.length || serverConfig.openapi?.passthroughHeaders?.length
               ? 'Only admins can import servers forwarding caller headers'
               : 'Only admins can import stdio-based server configurations',
         );
       }
-      await addServer(serverName, serverConfig);
+      await addServer(serverName, normalizeServerConfigForPersistence(serverConfig));
       details.push({ type: 'server', name: serverName, action: 'created' });
       serversCreated++;
     } catch (error) {

@@ -179,9 +179,47 @@ MCP 自身的 `--isolated` 标志不同，后者控制 Playwright 侧的浏览�
 ```
 
 <Tip>
-仅对真正持有会话级状态的服务器启用 `perSessionClient`。它会让上游连接（以及 stdio 子进程）
-数量随并发会话数成倍增长，因此对无状态服务器请保持关闭。
+对持有会话级状态或需要[旧协议工具 elicitation 转发](/zh/api-reference/mcp-http#elicitation-转发)
+的服务器启用 `perSessionClient`。它会让上游连接（以及 stdio 子进程）
+数量随并发会话数成倍增长，不需要以上功能时请保持关闭。
 </Tip>
+
+### 上游协议协商
+
+Streamable HTTP 上游默认使用 `protocolNegotiation: "auto"`，先探测
+`server/discover`，支持时使用新版无状态 HTTP，否则按 SDK 规则回退旧版握手。
+HTTP 探测超时、网络故障和认证失败可能使连接失败，而不是回退。
+已知只支持旧版的端点可跳过探测：
+
+```json
+{
+  "mcpServers": {
+    "legacy-gateway": {
+      "type": "streamable-http",
+      "url": "https://gateway.example.com/mcp",
+      "protocolNegotiation": "legacy"
+    }
+  }
+}
+```
+
+该可选字段接受 `"auto"` 和 `"legacy"`。`"auto"` 要求
+`type: "streamable-http"`；stdio 和旧 SSE 保持旧版协商。
+可通过配置 JSON、JSON 导入或服务器 API 设置；表单编辑和复制会保留该字段。
+文件、数据库、模板及声明式配置同步均支持，修改会重连服务器。
+共享、隔离和个人连接使用相同策略，但转发旧版 elicitation 的隔离连接在实现
+modern `input_required` 桥接前仍使用旧版协议。
+
+新版上游没有服务端推送流。相关请求会在上游 TTL 到期后刷新列表，并合并并发刷新。
+TTL 缺失、为零、无效或列表分页未完成时，下一次相关请求重新获取。
+健康检查仍需设置 `enableKeepAlive`；新版连接通过网络 `server/discover` 探测，
+不调用 `ping`。详见[兼容矩阵](/zh/api-reference/mcp-http#协议兼容矩阵)。
+
+共享远端 SSE 和 Streamable HTTP 服务在连接失败或连接关闭后会在后台自动重试，无需启用健康检查。重试使用指数退避和随机抖动，首次等待 5–10 秒，最高等待 150–300 秒，不限制重试次数；连接成功后重置。已禁用或等待 OAuth 授权的服务不会重试。关闭健康检查时，故障会在请求失败或连接关闭时被发现。控制台展示下次重试时间及上次重试的时间和次数，对应运行时 `recovery` 状态中的 `attempts`、`lastAttemptAt` 和 `nextAttemptAt`（时间戳单位为毫秒）。
+
+配置 `passthroughHeaders` 的新版上游按请求隔离 discovery 客户端和快照，不跨透传身份共享。
+每次相关请求增加一次 discovery 往返，个性化描述不写入全局缓存或向量索引。
+刷新失败只在当前请求中排除该上游，保留健康结果；部分列表返回零 TTL，后续请求会重试。
 
 ### MCP 2026-07-28 的路由请求头
 
@@ -727,6 +765,38 @@ ls -la /path/to/server
 
 省略该选项时保留 SDK 默认值 10 MiB（10485760 字节）。上限用于读取包含 MCP 消息封装的序列化数据的缓冲区。响应超过上限会关闭传输连接。提高上限会允许使用更多内存，请按服务器需求设置有限上限。零、负数、小数和非有限值均被拒绝。该选项不会改变 HTTP 传输或 SDK 处理大消息的性能。
 
+## Authorization 请求头透传
+
+默认禁止透传 `Authorization`。管理员如需向可信上游传递每次请求的调用者令牌，必须在文件模式的 `mcp_settings.json` 中显式配置：
+
+```json
+{
+  "systemConfig": {
+    "routing": {
+      "bearerAuthHeaderName": "X-MCP-Authorization",
+      "allowAuthorizationPassthrough": true
+    }
+  }
+}
+```
+
+管理员也可在 **设置 → 密钥 → 允许透传 Authorization** 中开启，开启前需先保存独立的 MCPHub 鉴权头；hosted 模式不显示该开关。数据库模式还可通过仅限管理员的 `PUT /api/system-config` 提交以下请求体，调用该管理接口时使用当前配置的 MCPHub 鉴权头：
+
+```json
+{
+  "routing": {
+    "bearerAuthHeaderName": "X-MCP-Authorization",
+    "allowAuthorizationPassthrough": true
+  }
+}
+```
+
+同时，在可信服务器的 `passthroughHeaders`（HTTP MCP）或 `openapi.passthroughHeaders`（OpenAPI）中列出 `Authorization`。随后每次 MCP 请求分别发送 `X-MCP-Authorization: Bearer <mcphub-key>` 和 `Authorization: Bearer <upstream-user-token>`。
+
+`allowAuthorizationPassthrough` 默认关闭，已有部署升级后不会自动开始透传。MCPHub 实际使用的鉴权头始终禁止透传；hosted 模式始终禁止透传 `Authorization`。`Cookie`、`Proxy-Authorization`、`X-Auth-Token` 和 `X-Api-Key` 也不受此开关影响，列入配置仍不会转发。
+
+该开关作用于整个实例，只应对可信上游启用；透传配置仍只允许管理员创建或修改。静态请求头和个人凭据是独立认证方式，不能等价替代每次请求携带的调用者令牌。
+
 ## 放行内网上游网络
 
 管理员可在设置页维护**允许访问的上游 CIDR 范围**，JSON 存储模式也可配置 `systemConfig.network.allowedCidrs`：
@@ -748,3 +818,87 @@ ls -la /path/to/server
 只有管理员可调用 `PUT /api/system-config`，请求体为 `{"network":{"allowedCidrs":["192.168.1.0/24"]}}`。传入空数组可清空白名单，非法列表返回 HTTP 400 且不会保存。数据库模式请通过管理界面或 API 配置，该字段持久化到系统配置表。
 
 请仅放行必要的最小范围。`0.0.0.0/0` 或 `::/0` 等过大的范围也会放行回环地址、云元数据端点等敏感内网目标。
+
+### 配合 TUN 路由使用 Fake-IP DNS
+
+管理员可在**设置 → 安全 → Fake-IP DNS 例外**中选择服务器、填写精确域名，增删规则后保存。服务器选择器保存稳定 ID；删除全部规则并保存可清空例外。
+
+对于可信本地 Fake-IP/TUN 环境中的 SSE 和 Streamable HTTP 上游，管理员可以仅允许一个稳定服务器 ID 的精确域名访问 `198.18.0.0/15`，无需全局放行该网段：
+
+```json
+{
+  "systemConfig": {
+    "network": {
+      "fakeIpExceptions": [
+        { "serverId": "existing-server-uuid", "hostname": "mcp.example.com" }
+      ]
+    }
+  }
+}
+```
+
+使用 `GET /api/servers` 返回的现有服务器 `id`，而非显示名称。域名必须是小写 ASCII DNS 名称，不能包含协议、端口、通配符或末尾点；国际化域名使用 punycode。缺少 ID 时不会匹配。数据库模式通过仅管理员可用的 `PUT /api/system-config` 配置，请求体为 `{"network":{"fakeIpExceptions":[{"serverId":"existing-server-uuid","hostname":"mcp.example.com"}]}}`。空数组清空例外。更新任一网络列表都会保留另一列表，包括在设置页修改 CIDR。
+
+例外适用于通过指定服务器 MCP 传输 fetch 发出的请求，包括复用该 fetch 的 SDK OAuth 请求。初始 DNS、每个重定向目标和建连时的 DNS 均执行同一策略，所有解析结果必须通过检查；不会额外放行回环、私网和元数据地址。IP 字面量 URL、其他域名或其他服务器 ID 均不匹配。跳转到其他域名且解析为 Fake-IP 时，需要独立匹配的例外；公网地址继续遵守普通策略。已有全局 CIDR 白名单和管理员所有者豁免仍然生效；需要此窄范围边界时，应使用非管理员拥有的服务器且不配置宽泛 CIDR。移除例外影响后续请求与解析，不会中止已有流或连接。
+
+受保护连接使用直接 socket DNS 校验，绕过配置的 HTTP/HTTPS 代理。系统级 TUN 必须接管并路由这些连接，其 DNS 映射必须与 MCPHub 进程或容器内可见的 DNS 一致。仅放行合成网段并不能建立路由。MCPHub 信任本地 DNS/TUN 映射，无法确认合成地址背后的真实目标；仅对可信端点及可信代理环境配置例外。TLS 仍使用原始域名。本策略不启用显式 HTTP 代理路由，也不为 OpenAPI 请求、独立的 OAuth 发现/令牌/注册 fetch 或匿名 CIMD URL 增加例外，这些请求继续遵守原有 SSRF 策略。使用这些独立 fetch 的 OAuth 配置，仍可能需要端点返回真实 DNS 地址。
+
+## 按需启动的工具快照
+
+对于 stdio 服务器，`startOnDemand: true` 让子进程在需要时才启动。MCPHub 会持久化最近一次成功发现的原始工具目录，重启后可直接恢复 `tools/list`，无需逐个启动所有按需服务器。成功发现的空工具列表也是有效快照。首次工具调用仍连接真实上游并刷新目录，上游已删除的工具不能仅凭快照执行。失败调用会触发目录刷新，但不会重放调用。
+
+文件模式将快照保存在设置文件旁的 `<settings-path>.capabilities.json`，容器替换后仍要保留快照时，请将该目录挂载到持久化存储。数据库模式使用 `capability_snapshots`表。快照不进入设置导出，也不包含启动配置或凭据；但工具定义可能包含上游私有元数据，请按运行时数据的要求保护其存储。
+
+服务器列表和详情 API 提供 `capabilityCache.state`（`fresh`、`stale`、`missing`）及可用时的 `capabilityCache.capturedAt`。`fresh` 表示配置匹配的历史发现结果，不保证上游此刻未发生变化。启动配置、子进程实际环境或个人凭据绑定变更会让快照失效。每次列举工具仍重新应用当前权限及服务器、分组的工具配置。个人快照按认证用户隔离，读取时仍要求有效的凭据绑定和当前服务器访问权限。
+
+快照缺失或不兼容时沿用实时发现流程：共享 stdio 服务器在启动时预发现，个人服务器在首次认证使用时发现。不增加全量后台刷新。配置不变时，上游包更新或外部权限变化需要等下次真实连接才能被发现。本阶段不持久化提示词和资源；个人服务器的提示词、资源请求仍连接真实上游。
+
+## 工具授权策略
+
+运营方可以在文件模式配置 `systemConfig.toolPolicies`，也可以在任一存储模式通过仅限管理员的 `PUT /api/system-config` 接口提交 `toolPolicies`。未配置或使用空数组时保留既有访问行为。管理员也可以在 **设置 → 工具访问策略** 中新增、编辑或删除规则，然后保存策略集。留空的选择器匹配任意值。保存空策略集会移除策略限制，但既有权限仍然生效。
+
+```json
+{
+  "systemConfig": {
+    "toolPolicies": [
+      {
+        "id": "agent-read",
+        "effect": "allow",
+        "keyId": "USER_KEY_ID",
+        "groupId": "GROUP_ID",
+        "serverId": "SERVER_ID",
+        "tool": "read_document"
+      },
+      {
+        "id": "block-delete",
+        "effect": "deny",
+        "tool": "delete_document"
+      }
+    ]
+  }
+}
+```
+
+每条规则包含唯一 `id`、`effect`（`allow` 或 `deny`），以及可选的精确匹配选择器 `username`、`keyId`、`groupId`、`serverId`、`tool`。省略的选择器不作限制，规则内的选择器取交集。`tool` 使用上游原始工具名，不包含服务器前缀、分组别名或 `preserveToolNames` 投影。密钥和分组使用既有 ID；管理员可从 `GET /api/servers/:name` 获取服务器的稳定 `data.config.id`。没有 ID 的旧文件条目使用确定性生成的 ID，在下一次 DAO 写入时保存，服务器改名后保持不变。新服务器获得新 ID，普通更新不能替换 ID。声明式数据库同步按名称匹配，文件改名不属于普通 DAO 改名：使用策略时，必须将已有 `data.config.id` 固定到服务器文件条目的 `id` 中，改名时保留该值；未固定 ID 会创建新身份，旧拒绝规则不再匹配。详见[数据库声明式配置](/zh/configuration/database-configuration)。
+
+**先按 username 和 keyId 确定主体适用规则，再匹配路由和目标。** 完整匹配的 deny 优先。若该主体有任何适用的 allow，当前路由、服务器和工具必须完整匹配至少一条 allow，否则拒绝。多个 allow 取并集；没有适用 allow 且没有匹配 deny 时保留既有行为。策略始终与可见性、密钥范围、分组权限、启用状态及能力选择取交集，管理员名下的用户密钥同样受限。
+
+`groupId` 约束普通分组端点和 `$smart/<group>` 解析出的分组。服务器直连、全局端点和裸 `$smart` 没有分组上下文，因此不能绕过仅允许指定分组的策略。如需通过直连或全局端点访问指定服务器和工具，应另配不含 `groupId` 的 allow。
+
+工具发现和调用共用策略判断。Smart Routing 在向量排序及 top-k 之前限制候选工具，执行前再次检查解析后的目标。被拒绝的调用不会获取个人凭据或调用上游。允许的用户密钥继续使用所有者的个人 OAuth 身份及刷新流程。策略配置出错时拒绝访问。外部 IdP 认证和声明映射不属于本策略模型。
+
+活动记录的 `policy` 对象包含 `decision`、`reason`，以及适用时的 `policyId`、`serverId`、`groupId`，并保留调用者、密钥和服务器、工具身份。文件模式将决策写入应用日志；持久化活动历史需要数据库模式。个人凭据调用仍不存储输入输出内容，策略审计元数据不包含凭据值。
+
+启用策略后，个人服务器直连端点中可能同时解释为原始名称、带前缀名称或网关包装工具的调用，应先获取工具列表。工具目录尚未消除歧义时，所有可能的目标都必须获得授权，否则在读取凭据前拒绝调用。
+
+编辑器会警告在已加载服务器、密钥或分组中找不到的 ID；启动完成数据库同步后也会检查引用并记录警告。警告不会阻止保存，便于预先配置资源。失效的拒绝规则不提供保护；失效的服务器或分组允许规则可能阻止适用主体访问，而失效的密钥选择器通常不会匹配任何主体。警告不能判断有效 ID 对应的规则是否会命中某个实际请求；工具名和用户名不在此次引用检查范围内。
+
+
+管理员可以在 **设置 → 系统设置 → 控制台名称** 中自定义名称，也可以在 `mcp_settings.json` 中设置 `systemConfig.dashboardName`（例如 `"dashboardName": "Team MCP"`）。名称会显示在侧栏、页头、登录页和浏览器标签中，首尾空格会被去除，长度上限为 100 个字符。保存空值可恢复默认名称。文件和数据库存储模式均支持持久化此设置。
+
+
+## 用户组共享
+
+管理员可在 **用户 → 编辑 → 用户组** 中用英文逗号分隔组名，也可通过 `PUT /api/users/:username` 提交 `userGroups: ["readers"]`。组名区分大小写，相同名称代表同一用户组；清空数组会移除该用户的所有成员关系。用户组独立于聚合服务器的 Group。
+
+将服务器设为 `visibility: "group"`，并配置 `sharedWithUserGroups: ["readers"]`，即可向该组所有成员授予使用权限。服务器与 Group 的共享界面均可选择用户组；共享 Group 路由不会自动授予其底层服务器权限。成员变更在下次认证请求时生效，包括现有用户级 key 和 OAuth 会话。共享不授予配置管理权限，工具 policy 仍可进一步收紧访问。

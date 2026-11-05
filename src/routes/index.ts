@@ -1,6 +1,12 @@
+import { handleOAuthRelay } from '../controllers/oauthRelayController.js';
 import { metrics } from '../controllers/metricsController.js';
 import { managePersonalOAuth } from '../controllers/personalOAuthController.js';
-import { listMyCredentials, updateMyCredential } from '../controllers/credentialBindingController.js';
+import {
+  listMyCredentials,
+  updateMyCredential,
+  listUserCredentials,
+  updateUserCredential,
+} from '../controllers/credentialBindingController.js';
 import express from 'express';
 import { check } from 'express-validator';
 import config from '../config/index.js';
@@ -20,6 +26,7 @@ import {
   disconnectServerOAuth,
   clearCache,
   toggleTool,
+  batchToggleTools,
   updateToolDescription,
   resetToolDescription,
   updateToolHiddenParams,
@@ -122,7 +129,10 @@ import {
   readResource,
 } from '../controllers/builtinResourceController.js';
 import { uploadMcpbFile, uploadMiddleware } from '../controllers/mcpbController.js';
-import { healthCheck } from '../controllers/healthController.js';
+import { healthCheck, livenessCheck, readinessCheck } from '../controllers/healthController.js';
+import { replicaConfiguration } from '../middlewares/replicaConfig.js';
+import { replicaStatus } from '../services/replicaService.js';
+import { isReplicaMode } from '../utils/replicaMode.js';
 import { getBetterAuthUser } from '../controllers/betterAuthController.js';
 import {
   getOpenAPISpec,
@@ -158,6 +168,7 @@ import {
   getBearerKeys,
   createBearerKey,
   updateBearerKey,
+  resetBearerKey,
   deleteBearerKey,
 } from '../controllers/bearerKeyController.js';
 import {
@@ -216,6 +227,8 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
 
   // Health check endpoint (no auth required, accessible at /health)
   app.get('/health', healthCheck);
+  app.get('/livez', livenessCheck);
+  app.get('/readyz', readinessCheck);
   app.get('/metrics', metrics);
 
   // Hosted data-plane webhook ingress. HMAC-authenticated by INTERNAL_API_SECRET.
@@ -227,6 +240,7 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   );
 
   // OAuth callback endpoint (no auth required, public callback URL)
+  app.get('/oauth/relay/:name', mcpConnectionRateLimiter, handleOAuthRelay);
   app.get('/oauth/callback', mcpConnectionRateLimiter, handleOAuthCallback);
 
   // OAuth Authorization Server endpoints (no auth required for OAuth flow)
@@ -261,6 +275,11 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   app.delete('/oauth/register/:clientId', mcpConnectionRateLimiter, deleteClientRegistration); // Delete client registration
 
   authenticatedRouter.use(authenticatedRouteRateLimiter);
+  authenticatedRouter.get('/cluster', requireAdminMiddleware, (_req, res) => {
+    if (!isReplicaMode()) { res.sendStatus(404); return; }
+    res.json({ success: true, data: replicaStatus() });
+  });
+  authenticatedRouter.use(replicaConfiguration);
   // `authenticatedRouter` is mounted at the end of this function, after the public
   // routes below have been registered on `router`. The order matters: the limiter
   // above is a path-less `use`, so it runs for every request that reaches the
@@ -270,6 +289,9 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   // instead of consuming the shared authenticated-route budget.
 
   // API routes protected by auth middleware in middlewares/index.ts and rate limited here
+  authenticatedRouter.get('/users/:username/credentials', listUserCredentials);
+  authenticatedRouter.put('/users/:username/credentials/:name', updateUserCredential);
+  authenticatedRouter.delete('/users/:username/credentials/:name', updateUserCredential);
   authenticatedRouter.get('/credentials', listMyCredentials);
   authenticatedRouter.put('/credentials/:name', updateMyCredential);
   authenticatedRouter.delete('/credentials/:name', updateMyCredential);
@@ -289,6 +311,7 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   authenticatedRouter.post('/servers/:name/oauth/personal', managePersonalOAuth);
   authenticatedRouter.delete('/servers/:name/oauth/personal', managePersonalOAuth);
   authenticatedRouter.post('/servers/:name/oauth/disconnect', disconnectServerOAuth);
+  authenticatedRouter.post('/servers/:serverName/tools/toggle', batchToggleTools);
   authenticatedRouter.post('/servers/:serverName/tools/:toolName/toggle', toggleTool);
   authenticatedRouter.put(
     '/servers/:serverName/tools/:toolName/description',
@@ -376,6 +399,7 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   authenticatedRouter.get('/auth/keys', getBearerKeys);
   authenticatedRouter.post('/auth/keys', createBearerKey);
   authenticatedRouter.put('/auth/keys/:id', updateBearerKey);
+  authenticatedRouter.post('/auth/keys/:id/reset', resetBearerKey);
   authenticatedRouter.delete('/auth/keys/:id', deleteBearerKey);
 
   // Activity routes (database mode only)
@@ -423,7 +447,12 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   // second write path to the stdio execution boundary (GHSA-xf2m-3c3x-53vp).
   // The admin gate must run before `uploadMiddleware` so multer never stages a
   // non-admin upload body on disk.
-  authenticatedRouter.post('/mcpb/upload', requireAdminMiddleware, uploadMiddleware, uploadMcpbFile);
+  authenticatedRouter.post(
+    '/mcpb/upload',
+    requireAdminMiddleware,
+    uploadMiddleware,
+    uploadMcpbFile,
+  );
 
   // Market routes
   authenticatedRouter.get('/market/servers', getAllMarketServers);

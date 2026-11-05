@@ -3,8 +3,35 @@ import { Request, Response } from 'express';
 import { ApiResponse, BearerKey, BearerKeyAccessType, BearerKeyKind } from '../types/index.js';
 import { getBearerKeyDao, getUserDao } from '../dao/index.js';
 import { logger } from '../utils/logger.js';
+import { maskBearerKey, toStoredToken } from '../utils/bearerKeyToken.js';
 
-const VALID_ACCESS_TYPES: BearerKeyAccessType[] = ['all', 'groups', 'servers', 'custom'];
+const VALID_ACCESS_TYPES: BearerKeyAccessType[] = [
+  'all',
+  'groups',
+  'servers',
+  'custom',
+  'exclude',
+];
+
+const normalizeStringList = (value: unknown): string[] | undefined =>
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : undefined;
+
+const validateExcludedScope = (
+  accessType: BearerKeyAccessType,
+  excludedGroups: string[],
+  excludedServers: string[],
+  res: Response,
+): boolean => {
+  if (accessType !== 'exclude') return true;
+  if (excludedGroups.length > 0 || excludedServers.length > 0) return true;
+  res.status(400).json({
+    success: false,
+    message: 'Exclude scope requires at least one excluded group or server',
+  });
+  return false;
+};
 
 type AuthenticatedUser = {
   username?: string;
@@ -14,13 +41,10 @@ type AuthenticatedUser = {
 const getAuthenticatedUser = (req: Request): AuthenticatedUser | undefined =>
   (req as any).user as AuthenticatedUser | undefined;
 
-const maskToken = (token: string): string =>
-  token.length > 12 ? `${token.slice(0, 8)}...${token.slice(-4)}` : '********';
-
-const sanitizeKey = (key: BearerKey): BearerKey => ({
+const sanitizeKey = ({ tokenHash, tokenPrefix, ...key }: BearerKey): BearerKey => ({
   ...key,
   kind: key.kind ?? 'system',
-  token: maskToken(key.token),
+  token: maskBearerKey({ token: key.token, tokenPrefix }),
 });
 
 const canManageKey = (user: AuthenticatedUser | undefined, key: BearerKey): boolean =>
@@ -74,6 +98,8 @@ export const createBearerKey = async (req: Request, res: Response): Promise<void
       accessType,
       allowedGroups,
       allowedServers,
+      excludedGroups,
+      excludedServers,
     } = req.body as Partial<BearerKey>;
 
     if (!name || typeof name !== 'string') {
@@ -104,6 +130,21 @@ export const createBearerKey = async (req: Request, res: Response): Promise<void
       return;
     }
 
+    const resolvedExcludedGroups =
+      kind === 'system' ? (normalizeStringList(excludedGroups) ?? []) : [];
+    const resolvedExcludedServers =
+      kind === 'system' ? (normalizeStringList(excludedServers) ?? []) : [];
+    if (
+      !validateExcludedScope(
+        resolvedAccessType ?? 'all',
+        resolvedExcludedGroups,
+        resolvedExcludedServers,
+        res,
+      )
+    ) {
+      return;
+    }
+
     const key = await getBearerKeyDao().create({
       name: name.trim(),
       token: `mcphub_${randomBytes(32).toString('hex')}`,
@@ -113,11 +154,14 @@ export const createBearerKey = async (req: Request, res: Response): Promise<void
       accessType: resolvedAccessType ?? 'all',
       allowedGroups: kind === 'system' && Array.isArray(allowedGroups) ? allowedGroups : [],
       allowedServers: kind === 'system' && Array.isArray(allowedServers) ? allowedServers : [],
+      excludedGroups: resolvedExcludedGroups,
+      excludedServers: resolvedExcludedServers,
     });
 
+    const { tokenHash: _hash, ...created } = key;
     res.status(201).json({
       success: true,
-      data: key,
+      data: created,
       message: 'Bearer key created. The token is only shown once.',
     } satisfies ApiResponse);
   } catch (error) {
@@ -147,7 +191,7 @@ export const updateBearerKey = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    const { name, enabled, accessType, allowedGroups, allowedServers } =
+    const { name, enabled, accessType, allowedGroups, allowedServers, excludedGroups, excludedServers } =
       req.body as Partial<BearerKey>;
     const updates: Partial<BearerKey> = {};
     if (name !== undefined) updates.name = name;
@@ -164,6 +208,34 @@ export const updateBearerKey = async (req: Request, res: Response): Promise<void
       if (allowedServers !== undefined) {
         updates.allowedServers = Array.isArray(allowedServers) ? allowedServers : [];
       }
+      if (excludedGroups !== undefined) {
+        updates.excludedGroups = normalizeStringList(excludedGroups) ?? [];
+      }
+      if (excludedServers !== undefined) {
+        updates.excludedServers = normalizeStringList(excludedServers) ?? [];
+      }
+
+      const resultingAccessType = updates.accessType ?? existing.accessType;
+      if (resultingAccessType !== 'exclude') {
+        // Drop exclusions when the key no longer uses the exclude scope.
+        updates.excludedGroups = [];
+        updates.excludedServers = [];
+      } else {
+        const resultingExcludedGroups =
+          updates.excludedGroups ?? existing.excludedGroups ?? [];
+        const resultingExcludedServers =
+          updates.excludedServers ?? existing.excludedServers ?? [];
+        if (
+          !validateExcludedScope(
+            resultingAccessType,
+            resultingExcludedGroups,
+            resultingExcludedServers,
+            res,
+          )
+        ) {
+          return;
+        }
+      }
     }
 
     const updated = await dao.update(id, updates);
@@ -171,6 +243,38 @@ export const updateBearerKey = async (req: Request, res: Response): Promise<void
   } catch (error) {
     logger.error('Failed to update bearer key:', error);
     res.status(500).json({ success: false, message: 'Failed to update bearer key' });
+  }
+};
+
+// Rotate only the secret; keep ownership, enabled state and resource scope intact.
+export const resetBearerKey = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      res.status(400).json({ success: false, message: 'Key id is required' });
+      return;
+    }
+    const dao = getBearerKeyDao();
+    const existing = await dao.findById(id);
+    if (!existing) {
+      res.status(404).json({ success: false, message: 'Bearer key not found' });
+      return;
+    }
+    if (!canManageKey(getAuthenticatedUser(req), existing)) {
+      res.status(403).json({ success: false, message: 'Forbidden' });
+      return;
+    }
+    const token = `mcphub_${randomBytes(32).toString('hex')}`;
+    const updated = await dao.update(id, { ...toStoredToken(token), token: undefined });
+    if (!updated) {
+      res.status(404).json({ success: false, message: 'Bearer key not found' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ success: true, data: { ...sanitizeKey(updated), token } } satisfies ApiResponse);
+  } catch (error) {
+    logger.error('Failed to reset bearer key:', error);
+    res.status(500).json({ success: false, message: 'Failed to reset bearer key' });
   }
 };
 

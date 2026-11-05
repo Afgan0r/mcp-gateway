@@ -8,6 +8,15 @@ MCPHub adopts the MCP `2026-07-28` specification (stateless core: no `initialize
 
 The path's shape comes from what the code actually binds to sessions. Most downstream state is derivable: the `enableSessionRebuild` mechanism already reconstructs full sessions from `(sessionId, group)` alone, per-session `Server` instances (`mcpService.ts`) are pure functions of group, and bearer auth is revalidated on every request. Two pieces are genuinely sticky and block step 3: `perSessionClient` upstream isolation plus OpenAPI per-session cookie jars (need an explicit-handle or header-correlation redesign), and the legacy SSE `/messages` endpoint whose group lives only in the session (dies with the transport). We use no sampling/elicitation/roots anywhere, so Multi Round-Trip Requests require zero migration.
 
+The original no-elicitation assumption above predates #1336. Initial elicitation
+forwarding now covers legacy tool calls on `perSessionClient` connections only.
+Each connection negotiates its downstream session's modes and serializes tool
+calls to avoid ambiguous parent-call attribution. Shared upstreams and personal
+runtimes continue without elicitation. Bridging legacy suspended operations to
+modern `input_required` retries remains a separate protocol design; explicit
+state IDs do not enable that bridge. See the
+[HTTP endpoint guide](../api-reference/mcp-http.mdx#elicitation-forwarding).
+
 ## Considered Options
 
 - **Big-bang move to v2 + new protocol now** — rejected: v2 GA'd weeks ago; bundling the transport/session rewrite (~700 lines of session tests plus integration tests encoding session-continuity semantics) with independently valuable OAuth fixes maximizes risk on both.
@@ -74,7 +83,13 @@ The [HTTP endpoint guide](../api-reference/mcp-http.mdx) and
 [Chinese version](../zh/api-reference/mcp-http.mdx) describe the current
 compatibility matrix and client migration steps. The step 2 boundary above
 records the intermediate migration stage; modern downstream HTTP is now enabled,
-while upstream clients retain legacy negotiation.
+while upstream Streamable HTTP now defaults to automatic negotiation under #1381.
+Stdio, legacy SSE, explicit `protocolNegotiation: "legacy"` overrides, and isolated
+connections forwarding legacy elicitation retain legacy negotiation. Modern
+upstream lists revalidate on demand at their original TTL expiry (unknown/zero
+TTLs and partial pages revalidate on the next request); concurrent refreshes
+coalesce per client, and health checks use network discovery instead of ping.
+The step 2 negotiation boundary above describes the historical migration stage.
 
 Legacy HTTP+SSE is documented as deprecated, with no announced removal release
 or date. Its removal requires a published schedule respecting the planned

@@ -6,10 +6,13 @@ import { getSettingsPath } from '../config/index.js';
 import { getCredentialBindingDao } from '../dao/DaoFactory.js';
 import { RequestContextService } from './requestContextService.js';
 import { getT } from '../utils/i18n.js';
+import { isDatabaseModeEnabled } from '../utils/systemConfigCache.js';
 import { logger } from '../utils/logger.js';
 import type { ServerConfig, StoredCredentialBinding } from '../types/index.js';
 import {
   CredentialBindingError,
+  isCredentialValueAllowed,
+  resolveCredentialUrl,
   argumentCredentialBindings,
   credentialSlotId,
   validateCredentialTemplate,
@@ -49,6 +52,11 @@ const encryptionKey = async (allowCreate = false): Promise<Buffer> => {
       'Personal credential encryption key is missing. Restore the key file or MCPHUB_CREDENTIAL_ENCRYPTION_KEY before using existing bindings',
     );
   if (!allowCreate) throw missing();
+  if (isDatabaseModeEnabled()) {
+    throw new CredentialBindingError(
+      'Database mode requires MCPHUB_CREDENTIAL_ENCRYPTION_KEY before saving personal credentials. Configure a persistent 32-byte base64 key; if bindings already exist, restore their original key. Automatic local key generation is disabled because container replacement can lose the key',
+    );
+  }
   const hasBindings = await getCredentialBindingDao().hasBindings();
   // Another process may have created the key while storage was being checked.
   const createdElsewhere = readKey();
@@ -98,7 +106,9 @@ export const encryptCredentialValues = async (
   ].join('.');
 };
 
-export const decryptCredentialValues = async (binding: StoredCredentialBinding): Promise<Record<string, string>> => {
+export const decryptCredentialValues = async (
+  binding: StoredCredentialBinding,
+): Promise<Record<string, string>> => {
   const key = await encryptionKey();
   try {
     const [version, iv, tag, ciphertext] = binding.encryptedValues.split('.');
@@ -142,16 +152,31 @@ export const getCredentialBindingStatus = async (
   serverName: string,
   username: string,
   config: ServerConfig,
+  includePreviews = false,
 ) => {
   const binding = await getCredentialBindingDao().get(serverName, username);
   const slots = validateCredentialTemplate(config) || [];
   const values = binding ? await decryptCredentialValues(binding) : {};
   const configuredSlots = slots
-    .map(credentialSlotId)
-    .filter((id) => typeof values[id] === 'string' && values[id].length > 0);
+    .filter((slot) => isCredentialValueAllowed(slot, values[credentialSlotId(slot)]))
+    .map(credentialSlotId);
   return {
     configured: slots.length > 0 && configuredSlots.length === slots.length,
     configuredSlots,
+    ...(includePreviews
+      ? {
+          valuePreviews: Object.fromEntries(
+            configuredSlots.map((id) => {
+              const characters = Array.from(values[id]);
+              const visible = characters.length <= 4 ? 1 : characters.length <= 8 ? 2 : 4;
+              return [
+                id,
+                `••••${characters.length > 1 ? characters.slice(-visible).join('') : ''}`,
+              ];
+            }),
+          ),
+        }
+      : {}),
     updatedAt: binding?.updatedAt ?? null,
   };
 };
@@ -183,10 +208,16 @@ export const saveCredentialBinding = async (
     throw new CredentialBindingError(
       'Provide a non-empty value for every declared slot; undeclared slots and invalid header values are not allowed',
     );
+  if (slots.some((slot) => !isCredentialValueAllowed(slot, record[credentialSlotId(slot)])))
+    throw new CredentialBindingError('Invalid URL credential binding');
   await getCredentialBindingDao().save({
     serverName,
     username,
-    encryptedValues: await encryptCredentialValues(serverName, username, record as Record<string, string>),
+    encryptedValues: await encryptCredentialValues(
+      serverName,
+      username,
+      record as Record<string, string>,
+    ),
     updatedAt: new Date().toISOString(),
   });
   credentialBindingEvents.emit('invalidate', { serverName, username });
@@ -253,6 +284,7 @@ export const resolveCredentialBinding = async (
   const values = await decryptCredentialValues(binding);
   const resolved: ServerConfig = {
     ...config,
+    url: resolveCredentialUrl(config, values),
     env: { ...config.env },
     headers: { ...config.headers },
   };
@@ -260,6 +292,7 @@ export const resolveCredentialBinding = async (
   for (const slot of slots) {
     const value = values[credentialSlotId(slot)];
     if (typeof value !== 'string' || !value.length) throw missingCredentialError(serverName);
+    if (slot.target === 'url') continue;
     if (slot.target === 'args') {
       argumentValues[slot.name] = value;
       continue;

@@ -1,9 +1,10 @@
+import UserGroupSelection from './UserGroupSelection';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Group } from '@/types';
 import { apiGet } from '@/utils/fetchInterceptor';
 
-type Access = Pick<Group, 'visibility' | 'sharedWithUsers'>;
+type Access = Pick<Group, 'visibility' | 'sharedWithUserGroups' | 'sharedWithUsers'>;
 
 export default function GroupVisibilityFields({
   groupId,
@@ -17,6 +18,7 @@ export default function GroupVisibilityFields({
   const { t } = useTranslation();
   const [users, setUsers] = useState<string[]>([]);
   const [search, setSearch] = useState('');
+  const [userGroups, setUserGroups] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
   const [isAdvancedExpanded, setIsAdvancedExpanded] = useState(false);
@@ -25,13 +27,15 @@ export default function GroupVisibilityFields({
     let cancelled = false;
     setLoading(true);
     setError(false);
-    apiGet<{ success: boolean; data?: string[] }>(
+    apiGet<{ success: boolean; data?: string[]; userGroups?: string[] }>(
       `/groups/${encodeURIComponent(groupId)}/share-candidates`,
     )
       .then((result) => {
         if (cancelled) return;
-        if (result.success && Array.isArray(result.data)) setUsers(result.data);
-        else setError(true);
+        if (result.success && Array.isArray(result.data)) {
+          setUsers(result.data);
+          setUserGroups(result.userGroups || []);
+        } else setError(true);
       })
       .catch(() => {
         if (!cancelled) setError(true);
@@ -66,17 +70,17 @@ export default function GroupVisibilityFields({
   return (
     <div className="mb-4">
       <div
-        className="flex items-center justify-between cursor-pointer bg-gray-50 dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700 p-3 rounded border border-gray-200 dark:border-gray-700"
+        className="flex items-center justify-between cursor-pointer bg-[var(--hub-bg-2)] hover:bg-[var(--hub-surface-hover)] p-3 rounded border border-[var(--hub-line)]"
         onClick={() => setIsAdvancedExpanded(!isAdvancedExpanded)}
       >
         <h3 className="text-sm font-semibold text-[var(--hub-ink)]">
           {t('server.sectionAdvanced', 'Advanced Options')}
         </h3>
-        <span className="text-gray-500 text-sm">{isAdvancedExpanded ? '▼' : '▶'}</span>
+        <span className="text-[var(--hub-ink-3)] text-sm">{isAdvancedExpanded ? '▼' : '▶'}</span>
       </div>
 
       {isAdvancedExpanded && (
-        <div className="border border-gray-200 dark:border-gray-700 rounded-b p-4 bg-white dark:bg-gray-900 border-t-0">
+        <div className="border border-[var(--hub-line)] rounded-b p-4 bg-[var(--hub-surface)] border-t-0">
           <label
             htmlFor="group-visibility"
             className="block text-sm font-medium mb-1.5 text-[var(--hub-ink-2)]"
@@ -85,7 +89,7 @@ export default function GroupVisibilityFields({
           </label>
           <select
             id="group-visibility"
-            className="w-full py-2 px-3 form-input"
+            className="hub-input"
             value={value.visibility || ''}
             onChange={(event) =>
               onChange({ visibility: event.target.value as Group['visibility'] })
@@ -100,24 +104,30 @@ export default function GroupVisibilityFields({
             <option value="group">{t('server.visibilityGroup')}</option>
             <option value="public">{t('server.visibilityPublic')}</option>
           </select>
-          <p className="text-xs text-gray-500 mt-1">{t('groups.visibilityDescription')}</p>
+          <p className="text-xs text-[var(--hub-ink-3)] mt-1">{t('groups.visibilityDescription')}</p>
           {!value.visibility && (
             <p className="text-sm text-amber-600">{t('groups.legacyVisibilityHint')}</p>
           )}
           {value.visibility === 'group' && (
-            <div className="mt-4 rounded border border-gray-200 dark:border-gray-700 p-3">
+            <div className="mt-4 rounded border border-[var(--hub-line)] p-3">
+              <UserGroupSelection
+                options={userGroups}
+                selected={value.sharedWithUserGroups || []}
+                disabled={loading || error || !groupId}
+                onChange={(sharedWithUserGroups) => onChange({ sharedWithUserGroups })}
+              />
               <div className="text-sm font-medium text-[var(--hub-ink-2)]">
                 {t('server.shareWithUsers')}
               </div>
-              <p className="text-xs text-gray-500 mt-1 mb-3">
+              <p className="text-xs text-[var(--hub-ink-3)] mt-1 mb-3">
                 {t('server.shareWithUsersDescription')}
               </p>
               {!groupId ? (
-                <p className="text-sm text-gray-500">{t('groups.shareAfterCreate')}</p>
+                <p className="text-sm text-[var(--hub-ink-3)]">{t('groups.shareAfterCreate')}</p>
               ) : (
                 <>
                   {loading && (
-                    <p className="text-sm text-gray-500">{t('server.shareCandidatesLoading')}</p>
+                    <p className="text-sm text-[var(--hub-ink-3)]">{t('server.shareCandidatesLoading')}</p>
                   )}
                   {error && (
                     <p role="alert" className="text-sm text-red-600 dark:text-red-400">
@@ -125,7 +135,7 @@ export default function GroupVisibilityFields({
                     </p>
                   )}
                   {!loading && !error && candidates.length === 0 && (
-                    <p className="text-sm text-gray-500">
+                    <p className="text-sm text-[var(--hub-ink-3)]">
                       {search ? t('server.noMatchingShareUsers') : t('server.noShareCandidates')}
                     </p>
                   )}
@@ -144,7 +154,7 @@ export default function GroupVisibilityFields({
                           value={search}
                           onChange={(event) => setSearch(event.target.value)}
                           placeholder={t('server.shareUserSearchPlaceholder')}
-                          className="w-full py-2 px-3 form-input text-sm"
+                          className="hub-input text-sm"
                         />
                         <div className="flex flex-wrap gap-2">
                           <button
@@ -179,7 +189,7 @@ export default function GroupVisibilityFields({
                         {candidates.map((username) => (
                           <label
                             key={username}
-                            className="flex items-center gap-2 rounded border border-gray-200 dark:border-gray-700 px-3 py-2 text-sm text-[var(--hub-ink-2)]"
+                            className="flex items-center gap-2 rounded border border-[var(--hub-line)] px-3 py-2 text-sm text-[var(--hub-ink-2)]"
                           >
                             <input
                               type="checkbox"

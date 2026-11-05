@@ -1,3 +1,5 @@
+import type { FakeIpException } from './network.js';
+import type { ToolPolicyRule, PolicyDecision } from './toolPolicy.js';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import {
   Client,
@@ -8,8 +10,22 @@ import {
 } from '@modelcontextprotocol/client';
 import { SmartRoutingConfig } from '../utils/smartRouting.js';
 
+export interface CapabilitySnapshot {
+  serverName: string;
+  principal: string;
+  fingerprint: string;
+  capturedAt: string;
+  tools: import('@modelcontextprotocol/client').Tool[];
+}
+
+export interface CapabilityCacheStatus {
+  state: 'fresh' | 'stale' | 'missing';
+  capturedAt?: string;
+}
+
 // User interface
 export interface IUser {
+  userGroups?: string[];
   username: string;
   password: string;
   isAdmin?: boolean;
@@ -20,6 +36,7 @@ export interface IUser {
 // Group interface for server grouping
 export interface IGroup {
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   id: string; // Unique UUID for the group
   name: string; // Display name of the group
@@ -33,6 +50,7 @@ export interface IGroup {
 export interface IGroupServerConfig {
   name: string; // Server name
   alias?: string; // Optional exposed name for this server within the group
+  preserveToolNames?: boolean; // Expose upstream tool names without a server prefix
   tools?: string[] | 'all'; // Array of specific tool names to include, or 'all' for all tools (default: 'all')
   prompts?: string[] | 'all'; // Array of specific prompt names to include, or 'all' for all prompts (default: 'all')
   resources?: string[] | 'all'; // Array of specific resource URIs to include, or 'all' for all resources (default: 'all')
@@ -252,9 +270,19 @@ export interface ToolResultCompressionConfig {
   strategy?: ToolResultCompressionStrategy;
 }
 
+export type { ToolPolicyRule, PolicyDecision } from './toolPolicy.js';
+
+export interface ToolPolicyAudit extends PolicyDecision {
+  serverId?: string;
+  groupId?: string;
+}
+
 export interface SystemConfig {
+  dashboardName?: string;
+  toolPolicies?: ToolPolicyRule[];
   network?: {
     allowedCidrs?: string[]; // Admin-managed ranges reachable by non-admin-owned upstreams.
+    fakeIpExceptions?: FakeIpException[];
   };
   routing?: {
     enableGlobalRoute?: boolean; // Controls whether the /sse endpoint without group is enabled
@@ -262,6 +290,7 @@ export interface SystemConfig {
     enableBearerAuth?: boolean; // Controls whether MCP endpoints require bearer authentication
     bearerAuthKey?: string; // Legacy bearer auth key (used for one-time migration)
     bearerAuthHeaderName?: string; // Header name used to receive bearer credentials for MCP/API requests (default: 'Authorization')
+    allowAuthorizationPassthrough?: boolean; // Admin opt-in; requires a separate MCPHub auth header.
     jsonBodyLimit?: string; // JSON request body size limit used by Express parser (default: '1mb'), including OpenAPI schema uploads
     skipAuth?: boolean; // Controls whether the dashboard requires login
   };
@@ -383,19 +412,23 @@ export interface OAuthServerConfig {
 }
 
 // Bearer authentication key configuration
-export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom';
+export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom' | 'exclude';
 export type BearerKeyKind = 'system' | 'user';
 
 export interface BearerKey {
   id: string; // Unique identifier for the key
   name: string; // Human readable key name
-  token: string; // Bearer token value
+  token?: string; // Raw token: only present in the creation response (or on legacy, not yet hashed keys)
+  tokenHash?: string; // SHA-256 hex of the token; what is stored and compared
+  tokenPrefix?: string; // First characters of the token, safe to display
   enabled: boolean; // Whether this key is enabled
   kind?: BearerKeyKind; // Defaults to 'system' for keys created before user-level keys existed
   owner?: string; // Required for user-level keys
   accessType: BearerKeyAccessType; // Access scope type
   allowedGroups?: string[]; // Allowed group names when accessType === 'groups' or 'custom'
   allowedServers?: string[]; // Allowed server names when accessType === 'servers' or 'custom'
+  excludedGroups?: string[]; // Excluded group names when accessType === 'exclude' (system keys only)
+  excludedServers?: string[]; // Excluded server names when accessType === 'exclude' (system keys only)
 }
 
 // Represents the settings for MCP servers
@@ -431,7 +464,8 @@ export interface ProxychainsConfig {
 export type ServerVisibility = 'private' | 'group' | 'public';
 
 export interface CredentialSlot {
-  target: 'env' | 'headers' | 'args';
+  target: 'env' | 'headers' | 'args' | 'url';
+  allowed?: string[];
   name: string;
   label?: string;
 }
@@ -445,6 +479,7 @@ export interface StoredCredentialBinding {
 
 // Configuration details for an individual server
 export interface ServerConfig {
+  id?: string; // Stable policy identity; runtime routing remains name-based.
   credentialTemplate?: CredentialSlot[]; // Metadata only; every slot requires a personal binding.
   type?: 'stdio' | 'sse' | 'streamable-http' | 'openapi'; // Type of server
   description?: string; // Optional server note/description for management UI
@@ -460,12 +495,14 @@ export interface ServerConfig {
   // Per-server visibility for non-admin users.
   //   'private' — only the owner (or admins) can see this server. Default.
   //   'public'  — every authenticated user can see this server.
-  //   'group'   — explicitly selected users can see this server.
+  //   'group'   — selected users and user-group members can see this server.
   // See issues #817 and #1037.
   visibility?: ServerVisibility;
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[]; // Local MCPHub usernames allowed when visibility is 'group'.
-  enableKeepAlive?: boolean; // Enable remote health checks and automatic reconnect attempts
-  keepAliveInterval?: number; // Health check and reconnect interval in milliseconds (default: 60000ms for SSE servers)
+  protocolNegotiation?: 'auto' | 'legacy'; // Streamable HTTP defaults to auto; other transports remain legacy.
+  enableKeepAlive?: boolean; // Enable remote health checks; disconnected remote servers always retry
+  keepAliveInterval?: number; // Health check interval in milliseconds (default: 60000ms for SSE servers)
   tools?: Record<string, { enabled: boolean; description?: string; hiddenParams?: string[] }>; // Tool-specific configurations: enable/disable state, custom description, top-level input parameters hidden from models
   prompts?: Record<string, { enabled: boolean; description?: string }>; // Prompt-specific configurations with enable/disable state and custom descriptions
   resources?: Record<string, { enabled: boolean; description?: string }>; // Resource-specific configurations with enable/disable state and custom descriptions
@@ -495,6 +532,7 @@ export interface ServerConfig {
     redirectUri?: string; // Preferred redirect URI for authorization requests and registration
     scopes?: string[]; // Required OAuth scopes
     accessToken?: string; // Pre-obtained access token (if available)
+    accessTokenExpiresAt?: number; // Absolute access token expiry in milliseconds
     refreshToken?: string; // Refresh token for renewing access
 
     // Dynamic client registration (RFC7591)
@@ -525,6 +563,9 @@ export interface ServerConfig {
     // MCP resource parameter (RFC8707) - the canonical URI of the MCP server
     resource?: string; // e.g., 'https://mcp.example.com/mcp'
 
+    // Explicit authorization-server metadata replaces SDK discovery for this upstream.
+    authorizationServerMetadata?: NonNullable<OAuthDiscoveryState['authorizationServerMetadata']>;
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
     // Authorization endpoint for user authorization (for authorization code flow)
     authorizationEndpoint?: string;
     // Token endpoint for exchanging authorization codes for tokens
@@ -604,7 +645,9 @@ export interface OpenAPISecurityConfig {
 
 // Information about a server's status and tools
 export interface ServerInfo {
+  capabilityCache?: CapabilityCacheStatus;
   name: string; // Unique name of the server
+  protocolVersion?: string; // Negotiated MCP protocol version for the current connection
   version?: string; // Upstream server version reported during MCP initialization
   // Resolved package version for stdio servers launched via npx/uvx (see #1166).
   // Read from the runner's install cache (npm _npx / uv tool environments),
@@ -618,6 +661,7 @@ export interface ServerInfo {
   instructions?: string; // Upstream server instructions reported during MCP initialization
   owner?: string; // Owner of the server, defaults to 'admin' user
   visibility?: ServerVisibility; // Carried over from ServerConfig so dataService.filterData can apply #817 visibility rules at runtime.
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[]; // Carried over for restricted user-sharing authorization.
   status: 'connected' | 'connecting' | 'disconnected' | 'oauth_required'; // Current connection status
   error: string | null; // Error message if any
@@ -630,6 +674,7 @@ export interface ServerInfo {
   options?: RequestOptions; // Options for requests
   createTime: number; // Timestamp of when the server was created
   enabled?: boolean; // Flag to indicate if the server is enabled
+  recovery?: { attempts: number; lastAttemptAt?: number; nextAttemptAt?: number };
   keepAliveIntervalId?: NodeJS.Timeout; // Timer ID for keep-alive ping interval
   config?: ServerConfig; // Reference to the original server configuration for OpenAPI passthrough headers
   // On-demand spawning runtime state
@@ -754,6 +799,7 @@ export interface BatchCreateServersResponse {
 // Request payload for adding a new group
 export interface AddGroupRequest {
   visibility?: IGroup['visibility'];
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   name: string; // Name of the group to add
   description?: string; // Optional description of the group
@@ -786,6 +832,7 @@ export type ActivityStatus = 'success' | 'error';
 
 // Activity interface for tracking tool calls
 export interface IActivity {
+  policy?: ToolPolicyAudit;
   id?: string; // Unique identifier (auto-generated for DB)
   timestamp: Date; // When the tool was called
   server: string; // Server name that handled the call
@@ -952,4 +999,15 @@ export interface OpenApiToolStats {
   estimatedTokens: number;
   /** Effective security requirement the spec declares, for form prefill (#1077). */
   declaredSecurity?: OpenAPIDeclaredSecurity;
+}
+
+/** One-shot updates to currently discovered tools; patterns are not persisted. */
+export interface BatchToggleToolsRequest {
+  enabled: boolean;
+  tools: string[];
+}
+
+export interface BatchToggleToolsResponse {
+  matchedTools: string[];
+  enabled: boolean;
 }

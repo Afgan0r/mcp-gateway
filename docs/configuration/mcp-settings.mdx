@@ -72,14 +72,15 @@ A server entry has the shape `"<server-name>": ServerConfig`. The relevant field
 | `type` | `"stdio" \| "sse" \| "streamable-http" \| "openapi"` | Recommended | Transport. Defaults to `stdio` when omitted but a `command` is provided. |
 | `enabled` | boolean | no | Defaults to `true`. Disabled servers stay in settings but are not connected. |
 | `owner` | string | no | Username that owns the entry. Defaults to the creating user or `admin`. Used for user-scoped routes (`/:user/mcp/...`). |
-| `visibility` | `"private" \| "group" \| "public"` | no | Runtime access for non-admin users. Defaults to `private`; `group` grants access to `sharedWithUsers`. |
+| `visibility` | `"private" \| "group" \| "public"` | no | Runtime access for non-admin users. Defaults to `private`; `group` grants access to selected users and user-group members. |
 | `sharedWithUsers` | string[] | no | Local usernames allowed to discover and call a server whose `visibility` is `group`. Ignored for other visibility values. |
+| `sharedWithUserGroups` | string[] | no | Case-sensitive user-group names whose members can use this server when `visibility` is `group`. Administrators set `userGroups` on users through the user edit form or `PUT /api/users/:username`. Existing user-key and OAuth requests read current memberships. |
 | `description` | string | no | Free-form description displayed in the dashboard. |
 | `options` | object | no | Per-server runtime options (see `src/types/index.ts`). |
 | `proxy` | object | no | Optional HTTP proxy settings (`url`, `noProxy`, etc.). |
 | `oauth` | object | no | Upstream OAuth client settings (used when the upstream server requires OAuth). |
-| `enableKeepAlive` | boolean | no | For `sse` / `streamable-http`: enable periodic health checks and automatic reconnect attempts. |
-| `keepAliveInterval` | number | no | Health check and reconnect interval in milliseconds. Defaults to `60000`. |
+| `enableKeepAlive` | boolean | no | For `sse` / `streamable-http`: enable periodic health checks. Disconnected remote servers always retry automatically with exponential backoff and jitter (5 seconds to 5 minutes); this interval only controls health probes. |
+| `keepAliveInterval` | number | no | Health check interval in milliseconds. Defaults to `60000`. |
 | `perSessionClient` | boolean | no | Create a dedicated upstream client per downstream MCP session instead of sharing one connection across all sessions. Use for stateful servers like Playwright. See [Per-session client isolation](#per-session-client-isolation-stateful-servers). |
 | `tools`, `prompts`, `resources` | object | no | Per-item overrides: `{ "<name>": { "enabled": true, "description": "..." } }`, keyed by the bare upstream name or the server-prefixed name. A tool entry can also carry `hiddenParams`: top-level input parameters removed from the schema models receive and dropped from their calls (required ones are never hidden). `enabled` is required in every entry. Managed via the dashboard or the per-resource API endpoints. |
 
@@ -199,10 +200,56 @@ Or with a locally spawned Playwright MCP using its `--isolated` flag:
 ```
 
 <Tip>
-Only enable `perSessionClient` for servers that actually hold per-session state.
+Enable `perSessionClient` for servers that hold per-session state or need
+[legacy tool-call elicitation forwarding](/api-reference/mcp-http#elicitation-forwarding).
 It multiplies upstream connections (and stdio child processes) by the number of
-concurrent sessions, so leave it off for stateless servers.
+concurrent sessions, so leave it off when neither feature is needed.
 </Tip>
+
+### Upstream protocol negotiation
+
+Streamable HTTP upstreams default to `protocolNegotiation: "auto"`. MCPHub probes
+`server/discover` and uses modern stateless HTTP when supported; legacy servers
+fall back to the existing handshake. HTTP probe timeouts and network or
+authentication failures can fail the connection rather than trigger fallback.
+To skip discovery for a known legacy endpoint, configure:
+
+```json
+{
+  "mcpServers": {
+    "legacy-gateway": {
+      "type": "streamable-http",
+      "url": "https://gateway.example.com/mcp",
+      "protocolNegotiation": "legacy"
+    }
+  }
+}
+```
+
+The optional field accepts `"auto"` or `"legacy"`. `"auto"` requires
+`type: "streamable-http"`; stdio and legacy SSE retain legacy negotiation.
+Configure this advanced option through settings JSON, JSON import or the server
+API; dashboard form edits and duplication preserve it. It is supported in both
+file and database storage, templates and declarative settings sync. Editing it
+reconnects the server. Shared, isolated and personal connections use the same
+policy, except isolated connections forwarding legacy elicitation remain legacy
+until a modern `input_required` bridge is available.
+
+Modern upstreams have no server-push stream. Lists are revalidated on relevant
+requests after their upstream TTL expires, with concurrent refreshes coalesced.
+Missing, zero or unusable TTLs and partial pages are revalidated on the next
+relevant request. Health checks remain opt-in via `enableKeepAlive`; modern
+connections probe `server/discover` over the network instead of `ping`.
+See the [compatibility matrix](/api-reference/mcp-http#protocol-compatibility).
+
+Shared remote SSE and Streamable HTTP servers retry in the background after a connection failure or a closed connection, even when health checks are disabled. Retries use exponential backoff with jitter, from 5–10 seconds initially up to 150–300 seconds, without a retry limit. Successful connections reset the backoff; disabled servers and servers waiting for OAuth authorization do not retry. With health checks disabled, an outage is detected when a request fails or the connection closes. The dashboard shows the next retry and the last retry time/count through the runtime `recovery` status (`attempts`, `lastAttemptAt`, and `nextAttemptAt`; timestamps are epoch milliseconds).
+
+For modern upstreams with `passthroughHeaders`, discovery clients and snapshots
+are request-local rather than shared across forwarded identities. Each relevant
+request adds a discovery round trip; those descriptors are not published to the
+global cache or vector index. If an upstream refresh fails, only that upstream
+is excluded from the current request; healthy results remain available and
+partial lists have zero TTL. Later requests retry the failed upstream.
 
 ### Routing headers over MCP 2026-07-28
 
@@ -458,7 +505,8 @@ For advanced use cases, you can provide your own proxychains4 configuration file
 When `configPath` is specified, all other proxy settings (`type`, `host`, `port`, etc.) are ignored, and the custom configuration file is used directly.
 </Tip>
 
-{/* ### Custom Server Scripts
+{/*
+### Custom Server Scripts
 
 #### Local Python Server
 
@@ -534,7 +582,8 @@ Complement `mcp_settings.json` with server metadata:
     }
   }
 }
-``` */}
+```
+*/}
 
 ## Group Management
 
@@ -567,7 +616,8 @@ In file mode, MCPHub re-reads `mcp_settings.json` when it changes, without a res
 
 In database mode, `mcp_settings.json` is a one-time seed by default. Set `MCPHUB_SETTINGS_SYNC=upsert` to apply server and group declarations on each startup, or `prune` to also delete removed managed entries; see [declarative database configuration](/configuration/database-configuration#declarative-servers-and-groups-gitops) for precedence and OAuth state handling.
 
-{/* ### Access Control
+{/*
+### Access Control
 
 | Access Level    | Description                |
 | --------------- | -------------------------- |
@@ -586,9 +636,11 @@ MCPHub supports hot reloading of configurations:
 # Reload configurations without restart
 curl -X POST http://localhost:3000/api/admin/reload-config \
   -H "Authorization: Bearer your-admin-token"
-``` */}
+```
+*/}
 
-{/* ### Configuration Validation
+{/*
+### Configuration Validation
 
 MCPHub validates configurations on startup and reload:
 
@@ -600,7 +652,8 @@ MCPHub validates configurations on startup and reload:
     "requireDocumentation": true
   }
 }
-``` */}
+```
+*/}
 
 ## System Routing Settings
 
@@ -612,6 +665,7 @@ You can also configure runtime routing and authentication behavior under `system
     "routing": {
       "enableBearerAuth": true,
       "bearerAuthHeaderName": "X-MCP-Authorization",
+      "allowAuthorizationPassthrough": true,
       "jsonBodyLimit": "5mb",
       "skipAuth": false
     }
@@ -620,8 +674,23 @@ You can also configure runtime routing and authentication behavior under `system
 ```
 
 - `bearerAuthHeaderName` defaults to `Authorization` and controls which incoming header MCPHub reads for Bearer authentication.
-- Use a custom header such as `X-MCP-Authorization` when an upstream MCP/OpenAPI server also needs to passthrough `Authorization`.
+- `allowAuthorizationPassthrough` defaults to `false`. To forward a caller's upstream `Authorization`, an administrator must explicitly enable it, use a separate MCPHub authentication header such as `X-MCP-Authorization`, and list `Authorization` in the trusted server's `passthroughHeaders` (HTTP MCP) or `openapi.passthroughHeaders` (OpenAPI).
+- The MCPHub authentication header is always blocked. `Authorization` remains blocked in hosted mode, and `Cookie`, `Proxy-Authorization`, `X-Auth-Token`, and `X-Api-Key` remain blocked regardless of the opt-in. Listing a blocked header does not forward it.
+- This instance-wide opt-in trusts every configured passthrough destination with the caller's upstream token. Only enable it for trusted destinations; passthrough configuration remains admin-only. Existing installations keep filtering `Authorization` until explicitly opted in.
 - `jsonBodyLimit` defaults to `1mb` and controls the Express JSON parser limit for API requests, including large inline OpenAPI schema uploads.
+
+Administrators can enable this in **Settings → Keys → Allow Authorization passthrough** after saving a separate MCPHub authentication header. The switch is hidden in hosted mode. In database mode, you can also use the admin-only `PUT /api/system-config` endpoint (authenticate with the currently configured MCPHub header):
+
+```json
+{
+  "routing": {
+    "bearerAuthHeaderName": "X-MCP-Authorization",
+    "allowAuthorizationPassthrough": true
+  }
+}
+```
+
+After configuring the server's passthrough list, send `X-MCP-Authorization: Bearer <mcphub-key>` and `Authorization: Bearer <upstream-user-token>` with each MCP request. Static upstream headers and personal credentials remain separate authentication options; they do not replace per-request caller tokens.
 
 ## Tool Result Compression
 
@@ -672,7 +741,8 @@ The activity log records the original upstream output before compression, so ope
    }
    ```
 
-{/* 2. **Limit server permissions**:
+{/*
+2. **Limit server permissions**:
    ```json
    {
      "filesystem": {
@@ -683,9 +753,11 @@ The activity log records the original upstream output before compression, so ope
        }
      }
    }
-   ``` */}
+   ```
+*/}
 
-{/* ### Performance
+{/*
+### Performance
 
 1. **Set appropriate timeouts**:
 
@@ -705,9 +777,11 @@ The activity log records the original upstream output before compression, so ope
        "MEMORY_LIMIT": "512MB"
      }
    }
-   ``` */}
+   ```
+*/}
 
-{/* ### Monitoring
+{/*
+### Monitoring
 
 1. **Enable health checks**:
 
@@ -729,9 +803,11 @@ The activity log records the original upstream output before compression, so ope
        "LOG_FORMAT": "json"
      }
    }
-   ``` */}
+   ```
+*/}
 
-{/* ## Troubleshooting
+{/*
+## Troubleshooting
 
 ### Common Issues
 
@@ -740,9 +816,11 @@ The activity log records the original upstream output before compression, so ope
 ```bash
 # Test command manually
 uvx mcp-server-fetch
-``` */}
+```
+*/}
 
-{/* **Environment variables not found**: Verify `.env` file
+{/*
+**Environment variables not found**: Verify `.env` file
 
 ```bash
 # Check environment
@@ -754,9 +832,11 @@ printenv | grep API_KEY
 ```bash
 # Verify executable permissions
 ls -la /path/to/server
-``` */}
+```
+*/}
 
-{/* ### Debug Configuration
+{/*
+### Debug Configuration
 
 Enable debug mode for detailed logging:
 
@@ -769,8 +849,9 @@ Enable debug mode for detailed logging:
     "logStartup": true
   }
 }
-``` */}
-{/* 
+```
+*/}
+{/*
 ### Validation Errors
 
 Common validation errors and solutions:
@@ -778,7 +859,8 @@ Common validation errors and solutions:
 1. **Missing required fields**: Add `command` and `args`
 2. **Invalid timeout**: Use number, not string
 3. **Environment variable not found**: Check `.env` file
-4. **Command not found**: Verify installation and PATH */}
+4. **Command not found**: Verify installation and PATH
+*/}
 
 This comprehensive guide covers all aspects of configuring MCP servers in MCPHub for various use cases and environments.
 
@@ -818,3 +900,80 @@ Each entry must be an IPv4 or IPv6 address with a prefix length (for example `/3
 Only admins can update the list through `PUT /api/system-config` with `{"network":{"allowedCidrs":["192.168.1.0/24"]}}`. Sending an empty array clears it. Invalid lists return HTTP 400 without saving. Database installations should use the dashboard or API; the field is stored in the system configuration table.
 
 Use the smallest necessary ranges. Broad ranges such as `0.0.0.0/0` or `::/0` also allow sensitive internal destinations, including loopback and cloud metadata endpoints.
+
+### Fake-IP DNS with TUN routing
+
+In **Settings → Security → Fake-IP DNS exceptions**, administrators can select a server, enter its exact hostname, add or delete rules, and save. The server selector stores its stable ID. Removing all rows and saving clears the exceptions.
+
+For SSE and Streamable HTTP upstreams behind a trusted local Fake-IP/TUN setup, administrators can grant an exact hostname on one stable server ID access to `198.18.0.0/15`, without globally allowing that range:
+
+```json
+{
+  "systemConfig": {
+    "network": {
+      "fakeIpExceptions": [
+        { "serverId": "existing-server-uuid", "hostname": "mcp.example.com" }
+      ]
+    }
+  }
+}
+```
+
+Use the existing server's `id` from `GET /api/servers` (not its display name). Hostnames must be lowercase ASCII DNS names, with no scheme, port, wildcard or trailing dot; use punycode for internationalized names. A missing ID never matches. In database mode, use the admin-only `PUT /api/system-config` with `{"network":{"fakeIpExceptions":[{"serverId":"existing-server-uuid","hostname":"mcp.example.com"}]}}`. An empty array clears exceptions. Updating either network list preserves the other, including when changing CIDRs through Settings.
+
+The exception applies to requests made through the named server's MCP transport fetch, including SDK OAuth requests that reuse that fetch. Initial DNS answers, every redirect destination and socket-time DNS answers follow the same policy. Every answer must pass; loopback, private and metadata addresses receive no additional permission. IP-literal URLs and unrelated hostnames or server IDs do not match. Redirects to another hostname require their own matching exception if they resolve to Fake-IP addresses; public destinations remain subject to normal policy. Existing global CIDR allowances and administrator-owner bypasses still apply, so use a non-admin-owned server and no broad CIDR allowances when this narrower boundary is required. Removing an exception affects later requests and lookups, but does not terminate existing streams or connections.
+
+Guarded connections use direct socket DNS validation and bypass configured HTTP/HTTPS proxies. A system-level TUN must intercept and route these connections, and its DNS mapping must agree with the DNS visible inside the MCPHub process/container. Merely allowing the synthetic range does not establish routing. MCPHub trusts the local DNS/TUN mapping and cannot determine the real destination behind a synthetic address; only grant exceptions for trusted endpoints and a trusted proxy environment. TLS still uses the original hostname. This policy does not enable explicit HTTP proxy routing or add exceptions to OpenAPI requests, separate OAuth discovery/token/registration fetches, or anonymous CIMD URLs; these keep their existing SSRF policy. OAuth setups using those separate fetches may therefore still need real DNS results for their endpoints.
+
+## On-demand tool snapshots
+
+For stdio servers, `startOnDemand: true` keeps the child process asleep until it is needed. MCPHub persists the last successful raw tool discovery so a restart can restore `tools/list` without starting every on-demand server. An empty tool list is also a valid snapshot. The first tool call still connects to the upstream and refreshes discovery; tools removed upstream cannot execute from the snapshot. Failed calls trigger a discovery refresh without replaying the call.
+
+File mode stores snapshots beside the settings file as `<settings-path>.capabilities.json`; mount that directory on persistent storage to retain snapshots across container replacement. Database mode stores them in the `capability_snapshots` table. Snapshots stay outside settings exports and contain no launch configuration or credentials. Tool definitions themselves may contain private upstream metadata, so protect snapshot storage like other runtime data.
+
+The server-list and server-detail APIs expose `capabilityCache.state` (`fresh`, `stale`, or `missing`) and `capabilityCache.capturedAt` when available. Here `fresh` means configuration-matching last-known discovery, not guaranteed current upstream state. Launch configuration, effective child environment, and personal credential binding changes invalidate a snapshot. Server/group tool overrides and permissions are reapplied when listing; they are never frozen into the snapshot. Personal snapshots are isolated by authenticated user, and listing still requires a valid binding and current server access.
+
+Missing or incompatible snapshots retain live discovery (startup priming for shared stdio servers, first authenticated use for personal servers). No fleet-wide background refresh is scheduled. Unchanged configuration cannot detect an upstream package update or external permission change until the next live connection. Prompts and resources are not persisted in this phase; personal prompt/resource requests still connect live.
+
+## Tool authorization policies
+
+Operators can configure `systemConfig.toolPolicies` in file mode or send `toolPolicies` to the administrator-only `PUT /api/system-config` endpoint in either storage mode. An omitted or empty array preserves existing access. Administrators can also manage rules in **Settings → Tool access policies**: add, edit or delete rules, then save the policy set. Blank selectors match any value. Saving an empty set removes policy restrictions while keeping existing permissions.
+
+```json
+{
+  "systemConfig": {
+    "toolPolicies": [
+      {
+        "id": "agent-read",
+        "effect": "allow",
+        "keyId": "USER_KEY_ID",
+        "groupId": "GROUP_ID",
+        "serverId": "SERVER_ID",
+        "tool": "read_document"
+      },
+      {
+        "id": "block-delete",
+        "effect": "deny",
+        "tool": "delete_document"
+      }
+    ]
+  }
+}
+```
+
+Each rule has a unique `id`, an `effect` (`allow` or `deny`), and optional exact-match `username`, `keyId`, `groupId`, `serverId`, and `tool` selectors. Omitted selectors are unconstrained. `tool` is the original upstream name, before server prefixes, group aliases, or `preserveToolNames` projection. Key and group IDs are their existing IDs; administrators can retrieve a server's stable `data.config.id` from `GET /api/servers/:name`. File entries without an ID receive a deterministic legacy ID, which is stored on the next DAO write and retained when the server is renamed. New servers receive new IDs; ordinary updates cannot replace an ID. Declarative database sync matches by name and is separate from ordinary DAO renames: when using policies, pin the existing `data.config.id` as `id` in each server file entry and retain it across renames. Without a pinned ID, a renamed declaration creates a new identity and old deny rules no longer match. See [declarative database configuration](/configuration/database-configuration).
+
+Username and key selectors establish the subject scope **before** matching the route or tool. For that subject, any fully matching deny wins. If any allow rules apply to the subject, at least one must fully match the requested route/server/tool; otherwise the call is denied. Multiple allows form a union. Without applicable allows or a matching deny, existing access is retained. Policies always intersect with visibility, key scope, group access, enabled state, and capability selections, including for administrator-owned user keys.
+
+A `groupId` selects the resolved endpoint group on normal and `$smart/<group>` routes. Direct server, global, and bare `$smart` routes have no group context. A group-only allow therefore cannot be bypassed through a direct/global endpoint. Add an allow without `groupId` to permit the selected servers/tools through those routes.
+
+Discovery and execution share the policy evaluator. Smart Routing limits eligible candidates before vector ranking/top-k, and execution checks the resolved target again. A denied call does not acquire personal credentials or invoke upstream. Allowed user keys retain the owner's personal OAuth identity and token refresh. Policy configuration errors fail closed. External IdP authentication and claim mapping are outside this policy model.
+
+Activity records include a `policy` object with `decision`, `reason`, optional `policyId`, `serverId`, and `groupId`, alongside caller/key and server/tool identity. File-mode deployments record decisions in application logs; persistent activity history requires database mode. Personal credential payloads remain omitted from activity records, and policy audit metadata never contains credential values.
+
+For direct personal-server endpoints with active policies, list tools before calls that could be interpreted as either raw, prefixed, or gateway wrapper names. Until discovery resolves that ambiguity, all possible targets must be authorized; otherwise the call is denied before credentials are resolved.
+
+The editor warns about IDs absent from the loaded servers, keys or groups. Startup also checks references after database synchronization and logs warnings. Warnings do not block saving, so resources can be configured in advance. An orphaned deny provides no protection; an allow referencing a missing server or group may block its applicable subjects, while a missing key selector normally matches no subject. These checks cannot determine whether a rule with valid IDs matches an actual request; tool names and usernames are not checked.
+
+
+Administrators can customize the dashboard name in **Settings → System Settings → Dashboard name**, or set `systemConfig.dashboardName` in `mcp_settings.json` (for example, `"dashboardName": "Team MCP"`). The name appears in the sidebar, header, login page, and browser tab. Names are trimmed and limited to 100 characters. Save an empty value to restore the default branding. This setting persists in both file and database storage modes.

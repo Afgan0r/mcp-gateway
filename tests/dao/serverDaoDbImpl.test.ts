@@ -28,6 +28,7 @@ describe('ServerDaoDbImpl', () => {
     const dao = new ServerDaoDbImpl();
 
     mockRepository.create.mockResolvedValue({
+      id: 'stable-server-id',
       name: 'serena',
       type: 'stdio',
       command: 'npx',
@@ -52,6 +53,7 @@ describe('ServerDaoDbImpl', () => {
     );
 
     expect(result.description).toBe('my server note');
+    expect(result.id).toBe('stable-server-id');
   });
 
   it('should persist and map passthroughHeaders field', async () => {
@@ -379,4 +381,31 @@ test('credential templates survive database create, partial update and explicit 
   expect(mockRepository.update).toHaveBeenCalledWith('shared', { credentialTemplate });
   await dao.update('shared', { credentialTemplate: undefined });
   expect(mockRepository.update).toHaveBeenLastCalledWith('shared', { credentialTemplate: null });
+});
+
+describe('protocolNegotiation database persistence', () => {
+  beforeEach(() => jest.clearAllMocks());
+  it('round-trips legacy through create, update, read and explicit clearing', async () => {
+    const dao = new ServerDaoDbImpl();
+    const row = {
+      name: 'remote',
+      type: 'streamable-http' as const,
+      enabled: true,
+      protocolNegotiation: 'legacy' as const,
+    };
+    mockRepository.create.mockResolvedValue(row);
+    expect((await dao.create(row)).protocolNegotiation).toBe('legacy');
+    expect(mockRepository.create).toHaveBeenCalledWith(
+      expect.objectContaining({ protocolNegotiation: 'legacy' }),
+    );
+    mockRepository.update.mockResolvedValue({ ...row, protocolNegotiation: 'auto' });
+    expect((await dao.update('remote', { protocolNegotiation: 'auto' }))?.protocolNegotiation).toBe(
+      'auto',
+    );
+    expect(mockRepository.update).toHaveBeenCalledWith('remote', { protocolNegotiation: 'auto' });
+    mockRepository.findByName.mockResolvedValue(row);
+    expect((await dao.findById('remote'))?.protocolNegotiation).toBe('legacy');
+    await dao.update('remote', { protocolNegotiation: undefined });
+    expect(mockRepository.update).toHaveBeenLastCalledWith('remote', { protocolNegotiation: null });
+  });
 });

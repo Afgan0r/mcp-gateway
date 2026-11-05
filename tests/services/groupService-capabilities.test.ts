@@ -20,6 +20,9 @@ jest.mock('../../src/dao/index.js', () => ({
 
 jest.mock('../../src/services/mcpService.js', () => ({
   notifyToolChanged: jest.fn(),
+  broadcastToolListChanged: jest.fn(),
+  broadcastPromptListChanged: jest.fn(),
+  broadcastResourceListChanged: jest.fn(),
 }));
 
 jest.mock('../../src/services/userContextService.js', () => ({
@@ -58,6 +61,7 @@ describe('groupService capability selections', () => {
         {
           name: 'server1',
           alias: 'fetch',
+          preserveToolNames: true,
           tools: ['search'],
           prompts: ['draft_prompt'],
           resources: ['resource://docs/guide'],
@@ -71,6 +75,7 @@ describe('groupService capability selections', () => {
       {
         name: 'server1',
         alias: 'fetch',
+        preserveToolNames: true,
         tools: ['search'],
         prompts: ['draft_prompt'],
         resources: ['resource://docs/guide'],

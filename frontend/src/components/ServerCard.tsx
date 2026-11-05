@@ -516,10 +516,11 @@ const ServerCard = ({
                 flexShrink: 0,
               }}
             />
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span
-                  className="hub-mono truncate"
+                  className="hub-mono min-w-0 max-w-full truncate"
+                  title={server.name}
                   style={{
                     fontSize: 13.5,
                     color: enabled ? 'var(--hub-ink)' : 'var(--hub-ink-3)',
@@ -529,20 +530,20 @@ const ServerCard = ({
                 </span>
                 {displayedVersion && (
                   <span
-                    className="hub-tag flex-shrink-0"
-                    title={t(packageVersion ? 'server.packageVersion' : 'server.reportedVersion')}
+                    className="hub-tag min-w-0"
+                    title={`${t(packageVersion ? 'server.packageVersion' : 'server.reportedVersion')}: ${displayedVersion}`}
                     style={{ fontSize: 11 }}
                   >
-                    v{displayedVersion}
+                    <span className="truncate">v{displayedVersion}</span>
                   </span>
                 )}
                 {supportsReinstall && server.updateAvailable && server.latestVersion && (
                   <span
-                    className="hub-tag flex-shrink-0"
-                    title={t('server.updateAvailable')}
+                    className="hub-tag min-w-0"
+                    title={`${t('server.updateAvailable')}: ${server.latestVersion}`}
                     style={{ fontSize: 11, color: 'var(--hub-warn)' }}
                   >
-                    ↑ {server.latestVersion}
+                    <span className="truncate">↑ {server.latestVersion}</span>
                   </span>
                 )}
                 {isMcpApp && (
@@ -635,7 +636,7 @@ const ServerCard = ({
           </div>
 
           {/* Status */}
-          <div className="hub-server-card-status-cell min-w-0">
+          <div className={`hub-server-card-status-cell min-w-0${enabled && server.recovery ? ' hub-server-card-recovering' : ''}`}>
             {server.config?.oauth?.identityMode === 'personal' ? (
               <PersonalOAuthControls serverName={server.name} enabled={enabled} />
             ) : (
@@ -646,6 +647,25 @@ const ServerCard = ({
                 onAuthClick={handleOAuth}
                 className="hub-server-card-status"
               />
+            )}
+            {enabled && server.recovery && (
+              <div className="text-xs mt-1" style={{ color: 'var(--hub-ink-3)', maxWidth: 160 }}>
+                <div>
+                  {server.recovery.nextAttemptAt
+                    ? t('server.retryScheduled', {
+                        time: new Date(server.recovery.nextAttemptAt).toLocaleTimeString(undefined, { hour12: false }),
+                      })
+                    : t('server.reconnecting')}
+                </div>
+                {server.recovery.lastAttemptAt && (
+                  <div>
+                    {t('server.lastRetry', {
+                      count: server.recovery.attempts,
+                      time: new Date(server.recovery.lastAttemptAt).toLocaleTimeString(undefined, { hour12: false }),
+                    })}
+                  </div>
+                )}
+              </div>
             )}
           </div>
 
@@ -660,6 +680,16 @@ const ServerCard = ({
               </span>
             ) : (
               <span style={{ color: 'var(--hub-ink-3)', fontSize: 12 }}>—</span>
+            )}
+            {server.config?.type !== 'openapi' && (
+              <span className="hub-server-card-protocol" title={t('server.protocolVersion')}>
+                MCP{' '}
+                {enabled && server.status === 'connected' && server.protocolVersion ? (
+                  <span className="whitespace-nowrap">{server.protocolVersion}</span>
+                ) : (
+                  t('server.protocolVersionUnknown')
+                )}
+              </span>
             )}
           </div>
 
@@ -883,6 +913,26 @@ const ServerCard = ({
               padding: '14px 16px 16px 38px',
             }}
           >
+            {server.config?.description && (
+              <section
+                className="mb-3"
+                aria-labelledby={`server-about-${server.name}`}
+              >
+                <h3
+                  id={`server-about-${server.name}`}
+                  className="text-[11px] font-medium tracking-wide uppercase"
+                  style={{ color: 'var(--hub-ink-3)', marginBottom: 6 }}
+                >
+                  {t('server.description')}
+                </h3>
+                <p
+                  className="text-[13px] leading-5 whitespace-pre-wrap break-words m-0"
+                  style={{ color: 'var(--hub-ink-2)' }}
+                >
+                  {server.config.description}
+                </p>
+              </section>
+            )}
             {/* Capability tabs + endpoint on same row */}
             <div className="flex items-center gap-1 mb-2 flex-wrap">
               {capabilitySummaries.map((tab) => {

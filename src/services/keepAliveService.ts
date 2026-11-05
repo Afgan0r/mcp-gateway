@@ -25,20 +25,56 @@ export const setupClientKeepAlive = async (
     return;
   }
 
-  const enabled = serverConfig.enableKeepAlive === true;
-  if (!enabled) {
-    // Ensure any previous timer is cleared
-    if (serverInfo.keepAliveIntervalId) {
-      clearInterval(serverInfo.keepAliveIntervalId as NodeJS.Timeout);
-      serverInfo.keepAliveIntervalId = undefined;
-    }
+  // Repeated failed calls must not postpone an already scheduled recovery.
+  if (
+    serverInfo.enabled !== false &&
+    serverInfo.status === 'disconnected' &&
+    serverInfo.recovery?.nextAttemptAt !== undefined &&
+    serverInfo.keepAliveIntervalId
+  )
+    return;
+
+  if (serverInfo.keepAliveIntervalId) {
+    clearInterval(serverInfo.keepAliveIntervalId);
+    serverInfo.keepAliveIntervalId = undefined;
+  }
+
+  const canRetry = (): boolean =>
+    serverInfo.enabled !== false && serverInfo.status === 'disconnected';
+
+  if (serverInfo.enabled === false || serverInfo.status === 'oauth_required') {
+    serverInfo.recovery = undefined;
     return;
   }
 
-  // Clear any existing interval first
-  if (serverInfo.keepAliveIntervalId) {
-    clearInterval(serverInfo.keepAliveIntervalId as NodeJS.Timeout);
+  if (serverInfo.status === 'disconnected' && options.reconnectServer) {
+    const recovery = serverInfo.recovery ?? { attempts: 0 };
+    serverInfo.recovery = recovery;
+    // Equal jitter keeps retries spread out, bounded between 5 seconds and 5 minutes.
+    const ceiling = Math.min(300000, 10000 * 2 ** Math.min(recovery.attempts, 5));
+    const delay = Math.round(ceiling * (0.5 + Math.random() * 0.5));
+    recovery.nextAttemptAt = Date.now() + delay;
+    serverInfo.keepAliveIntervalId = setTimeout(async () => {
+      serverInfo.keepAliveIntervalId = undefined;
+      recovery.nextAttemptAt = undefined;
+      if (!canRetry()) return;
+      recovery.attempts += 1;
+      recovery.lastAttemptAt = Date.now();
+      try {
+        await options.reconnectServer!(serverInfo.name);
+      } catch (error) {
+        if (canRetry() && serverInfo.recovery === recovery) {
+          serverInfo.error = `Reconnect failed: ${formatErrorForLogging(error)}`;
+          await setupClientKeepAlive(serverInfo, serverConfig, options);
+        }
+      }
+    }, delay);
+    return;
   }
+
+  if (serverInfo.status === 'connected') serverInfo.recovery = undefined;
+  const enabled = serverConfig.enableKeepAlive === true;
+  if (!enabled) return;
 
   // Default interval: 60 seconds
   const interval = serverConfig.keepAliveInterval || 60000;
@@ -61,29 +97,8 @@ export const setupClientKeepAlive = async (
       return;
     }
 
-    if ((!activeClient || serverInfo.status === 'disconnected') && options.reconnectServer) {
-      isChecking = true;
-      try {
-        logger.log('Keep-alive reconnecting disconnected server', {
-          serverName: serverInfo.name,
-        });
-        await options.reconnectServer(serverInfo.name);
-      } catch (error) {
-        if (!shouldSkipCheck() && serverInfo.status === 'disconnected') {
-          const message = formatErrorForLogging(error);
-          const nextError = `Reconnect failed: ${message}`;
-          if (serverInfo.error !== nextError) {
-            logger.warn('Keep-alive reconnect failed', {
-              serverName: serverInfo.name,
-              error,
-            });
-          }
-          serverInfo.status = 'disconnected';
-          serverInfo.error = nextError;
-        }
-      } finally {
-        isChecking = false;
-      }
+    if (serverInfo.status === 'disconnected' && options.reconnectServer) {
+      await setupClientKeepAlive(serverInfo, serverConfig, options);
       return;
     }
 
@@ -94,9 +109,12 @@ export const setupClientKeepAlive = async (
     isChecking = true;
 
     try {
-      // Use client.ping() if available, otherwise fallback to listTools.
-      if (typeof (activeClient as any).ping === 'function') {
-        await (activeClient as any).ping({ ...(serverInfo.options || {}), timeout: 5000 });
+      // Modern HTTP has no ping or server-push channel. Discovery is supported
+      // even by servers that expose no tools and discover() always performs a network request.
+      if (activeClient.getProtocolEra?.() === 'modern') {
+        await activeClient.discover({ ...(serverInfo.options || {}), timeout: 5000 });
+      } else if (typeof activeClient.ping === 'function') {
+        await activeClient.ping({ ...(serverInfo.options || {}), timeout: 5000 });
       } else {
         await activeClient.listTools({}, { ...(serverInfo.options || {}), timeout: 5000 });
       }
@@ -124,6 +142,7 @@ export const setupClientKeepAlive = async (
       }
       serverInfo.status = 'disconnected';
       serverInfo.error = nextError;
+      await setupClientKeepAlive(serverInfo, serverConfig, options);
     } finally {
       isChecking = false;
     }
@@ -143,6 +162,7 @@ export const setupClientKeepAlive = async (
  * Clear keep-alive timer for a server.
  */
 export const clearClientKeepAlive = (serverInfo: ServerInfo): void => {
+  serverInfo.recovery = undefined;
   if (serverInfo.keepAliveIntervalId) {
     clearInterval(serverInfo.keepAliveIntervalId as NodeJS.Timeout);
     serverInfo.keepAliveIntervalId = undefined;

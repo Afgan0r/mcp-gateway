@@ -12,6 +12,7 @@ import { expandServerConfig } from '../services/serverConfigEnvironment.js';
 import { ServerConfig } from '../types/index.js';
 import { normalizeServerConfigForPersistence } from './serverConfigPersistence.js';
 import { logger } from './logger.js';
+import { legacyServerId } from './serverIdentity.js';
 
 const deriveFingerprint = promisify(pbkdf2);
 
@@ -38,6 +39,7 @@ const declarationSchema = z.object({
       name,
       z
         .object({
+          id: z.string().uuid().optional(),
           type: z.enum(['stdio', 'sse', 'streamable-http', 'openapi']).optional(),
           url: z.string().optional(),
           command: z.string().optional(),
@@ -46,8 +48,10 @@ const declarationSchema = z.object({
           headers: z.record(z.string(), z.string()).optional(),
           description: z.string().optional(),
           owner: z.string().optional(),
+          sharedWithUserGroups: z.array(z.string()).optional(),
           sharedWithUsers: z.array(z.string()).optional(),
           enableKeepAlive: z.boolean().optional(),
+          protocolNegotiation: z.enum(['auto', 'legacy']).optional(),
           keepAliveInterval: z.number().int().positive().optional(),
           startOnDemand: z.boolean().optional(),
           idleTimeoutMs: z.number().positive().optional(),
@@ -91,6 +95,7 @@ const declarationSchema = z.object({
         instructions: z.string().optional(),
         owner: z.string().optional(),
         visibility: z.enum(['private', 'group', 'public']).optional(),
+        sharedWithUserGroups: z.array(z.string()).optional(),
         sharedWithUsers: z.array(z.string()).optional(),
         servers: z
           .array(
@@ -99,6 +104,7 @@ const declarationSchema = z.object({
               z.object({
                 name,
                 alias: z.string().optional(),
+                preserveToolNames: z.boolean().optional(),
                 tools: selection.optional(),
                 prompts: selection.optional(),
                 resources: selection.optional(),
@@ -133,7 +139,7 @@ export async function syncSettingsToDatabase(): Promise<void> {
     throw new Error(`Unsupported MCPHUB_SETTINGS_SYNC: ${mode}`);
 
   const declaration = declarationSchema.parse(
-    JSON.parse(fs.readFileSync(getSettingsPath(), 'utf8')),
+    JSON.parse(fs.readFileSync(getSettingsPath(), 'utf8').replace(/^\uFEFF/, '')),
   );
   for (const name of Object.keys(declaration.mcpServers ?? {}))
     assertSmartRoutingNameAvailable(name);
@@ -157,6 +163,7 @@ export async function syncSettingsToDatabase(): Promise<void> {
       // Tokens and pending authorization are runtime state, never declarations.
       if (oauth) {
         delete oauth.accessToken;
+        delete oauth.accessTokenExpiresAt;
         delete oauth.refreshToken;
         delete oauth.pendingAuthorization;
       }
@@ -183,6 +190,16 @@ export async function syncSettingsToDatabase(): Promise<void> {
     const serverRepo = manager.getRepository(Server);
     for (const { serverName, config, signature } of servers) {
       const existing = await serverRepo.findOneBy({ name: serverName });
+      if (existing && config.id && config.id !== existing.id) {
+        logger.warn(
+          'Settings sync: ignoring declared ID; existing database server ID is retained',
+          {
+            serverName,
+            declaredId: config.id,
+            retainedId: existing.id,
+          },
+        );
+      }
       const hash = await fingerprintDeclaration(signature, existing?.settingsSyncHash);
       const sameTarget =
         existing &&
@@ -200,6 +217,7 @@ export async function syncSettingsToDatabase(): Promise<void> {
       const oauth =
         sameTarget && sameOAuth ? { ...config.oauth, ...existing?.oauth } : config.oauth;
       const data: Record<string, unknown> = {
+        id: existing?.id ?? config.id ?? legacyServerId(serverName),
         name: serverName,
         enabled: config.enabled ?? true,
         visibility: config.visibility ?? 'private',
@@ -237,6 +255,7 @@ export async function syncSettingsToDatabase(): Promise<void> {
         instructions: group.instructions ?? null,
         owner: group.owner ?? null,
         visibility: group.visibility ?? null,
+        sharedWithUserGroups: group.sharedWithUserGroups ?? null,
         sharedWithUsers: group.sharedWithUsers ?? null,
       };
       const unchanged =

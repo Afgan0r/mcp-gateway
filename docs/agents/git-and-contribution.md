@@ -1,9 +1,22 @@
 # Git and contribution workflow
 
 - Use Conventional Commits such as `feat:`, `fix:`, `chore:`, and `refactor:` in imperative present tense.
-- Pull requests should describe the behavior change, list automated and manual validation, attach before/after evidence for UI work, and link related issues.
+- Pull requests should describe the behavior change, list automated and manual validation, and link related issues.
 - Keep generated artifacts out of commits and pull requests.
 - `gh` is not guaranteed to be on the agent shell `PATH`: agent shells run non-interactively with a minimal `PATH` and do not load the user's profile, so a bare `gh ...` can fail with `command not found` even when `gh` is installed. See [development.md](development.md) ("Agent shell `PATH`") for how to locate and export it.
+
+## UI screenshots in pull requests
+
+- Unless explicitly requested otherwise, use the English UI for all screenshots.
+
+- Any pull request with visible UI changes must include browser screenshots in the PR body or a PR comment. Upload the images to GitHub so reviewers can view them; local file paths do not count.
+- Show before/after screenshots for changes to existing UI, or the resulting state for new UI. Capture the affected states and viewport sizes, including mobile when responsive behavior changes.
+- Label viewport sizes and disclose mocked data or simulated states. Verify that the uploaded images render in the PR before considering the task complete.
+
+## Public documentation formatting
+
+- In Markdown and MDX prose, keep each paragraph on one source line and separate paragraphs with a blank line. Do not manually wrap prose to a fixed column width; let the editor or viewer wrap it visually. Preserve intentional line breaks in lists, tables, code blocks, and MDX components.
+- Match the surrounding formatting and apply the same paragraph convention to both English and Chinese documentation. Avoid reformatting unrelated content.
 
 ## Issue tracker
 

@@ -1,3 +1,4 @@
+import { getToolPolicy } from './toolPolicyService.js';
 /**
  * Smart Routing Service
  *
@@ -5,6 +6,7 @@
  * AI-powered tool discovery using vector semantic search.
  */
 
+import { projectGroupToolName, assertValidGroupToolNames } from '../utils/groupToolNames.js';
 import { Tool, ServerInfo, IGroupServerConfig } from '../types/index.js';
 import {
   getGroupServerExposedName,
@@ -135,24 +137,40 @@ const projectNameForGroup = (
   name: string,
   serverName: string,
   serverConfigsByName: Map<string, IGroupServerConfig>,
-): string => {
-  return replacePrefixedServerName(
-    name,
-    serverName,
-    getExposedServerName(serverName, serverConfigsByName.get(serverName)),
-  );
-};
+): string =>
+  projectGroupToolName(name, serverName, serverConfigsByName.get(serverName), getNameSeparator());
 
 const resolveNameFromGroup = (
   name: string,
   serverName: string,
   serverConfigsByName: Map<string, IGroupServerConfig>,
-): string => {
-  return replacePrefixedServerName(
-    name,
-    getExposedServerName(serverName, serverConfigsByName.get(serverName)),
-    serverName,
-  );
+): string =>
+  serverConfigsByName.get(serverName)?.preserveToolNames
+    ? `${serverName}${getNameSeparator()}${name}`
+    : replacePrefixedServerName(
+        name,
+        getExposedServerName(serverName, serverConfigsByName.get(serverName)),
+        serverName,
+      );
+
+// Check the full catalog, rather than just search hits, so routing never depends on result order.
+const validateOriginalToolNames = async (
+  targetGroup: string | undefined,
+  configs: Map<string, IGroupServerConfig>,
+): Promise<void> => {
+  if (![...configs.values()].some((config) => config.preserveToolNames)) return;
+  const tools: Array<{ name: string }> = [];
+  for (const server of await getAvailableServers(targetGroup)) {
+    const enabled = await filterToolsByConfigFn(
+      server.name,
+      server.tools.filter((tool) => !isAppOnlyTool(tool)),
+    );
+    const visible = await filterToolsByGroupFn(targetGroup, server.name, enabled);
+    tools.push(
+      ...visible.map((tool) => ({ name: projectNameForGroup(tool.name, server.name, configs) })),
+    );
+  }
+  assertValidGroupToolNames(tools);
 };
 
 const projectToolForGroup = (tool: any, serverConfigsByName: Map<string, IGroupServerConfig>) => {
@@ -370,7 +388,10 @@ Available servers: ${serversList}`,
  * available.
  */
 const getAvailableServers = async (targetGroup: string | undefined): Promise<ServerInfo[]> => {
-  const servers = getServerInfos().filter(canServeToolRequests);
+  const policy = await getToolPolicy(targetGroup);
+  const servers = getServerInfos()
+    .filter(canServeToolRequests)
+    .filter((server) => policy.authorize(server.name, undefined, true).decision === 'allow');
   if (!targetGroup) {
     return servers;
   }
@@ -387,6 +408,7 @@ const computeSmartRoutingScope = async (
   // Extract target group if pattern is $smart/{group}
   const targetGroup = getSmartTargetGroup(group);
   const serverConfigsByName = await getGroupServerConfigMap(targetGroup);
+  await validateOriginalToolNames(targetGroup, serverConfigsByName);
 
   const availableServers = await getAvailableServers(targetGroup);
 
@@ -510,6 +532,7 @@ export const handleSearchToolsRequest = async (
     group = targetGroup;
   }
   const serverConfigsByName = await getGroupServerConfigMap(targetGroup);
+  await validateOriginalToolNames(targetGroup, serverConfigsByName);
   const availableServers = await getAvailableServers(targetGroup);
   const servers = availableServers.map((server) => server.name);
   if (targetGroup) {
@@ -520,8 +543,27 @@ export const handleSearchToolsRequest = async (
     );
   }
 
+  const policy = await getToolPolicy(group);
+  let allowedToolIds: string[] | undefined;
+  if (policy.active) {
+    allowedToolIds = [];
+    for (const server of availableServers) {
+      const configured = await filterToolsByConfigFn(
+        server.name,
+        server.tools.filter((tool) => !isAppOnlyTool(tool)),
+      );
+      const selected = await filterToolsByGroupFn(targetGroup, server.name, configured);
+      allowedToolIds.push(
+        ...policy.filterTools(server.name, selected).map((tool) => `${server.name}:${tool.name}`),
+      );
+    }
+  }
   const searchResults =
-    servers.length > 0 ? await searchToolsByVector(query, limitNum, thresholdNum, servers) : [];
+    servers.length === 0 || allowedToolIds?.length === 0
+      ? []
+      : allowedToolIds
+        ? await searchToolsByVector(query, limitNum, thresholdNum, servers, allowedToolIds)
+        : await searchToolsByVector(query, limitNum, thresholdNum, servers);
   logger.log(`Search results: ${JSON.stringify(searchResults)}`);
 
   // Find actual tool information from serverInfos by serverName and toolName
@@ -702,6 +744,7 @@ export const handleDescribeToolRequest = async (
   let group = getMcpRequestGroup({ sessionId, group: requestGroup });
   const targetGroup = getSmartTargetGroup(group);
   const serverConfigsByName = await getGroupServerConfigMap(targetGroup);
+  await validateOriginalToolNames(targetGroup, serverConfigsByName);
   if (targetGroup) {
     group = targetGroup;
   }

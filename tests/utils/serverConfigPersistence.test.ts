@@ -2,6 +2,15 @@ import { normalizeServerConfigForPersistence } from '../../src/utils/serverConfi
 import { ServerConfig, ServerInfo } from '../../src/types/index.js';
 
 describe('normalizeServerConfigForPersistence', () => {
+  it('preserves absolute OAuth expiry alongside its shared access token', () => {
+    const config = {
+      type: 'streamable-http' as const,
+      url: 'https://example.com/mcp',
+      oauth: { accessToken: 'opaque', accessTokenExpiresAt: 12345 },
+    };
+    expect(normalizeServerConfigForPersistence(config).oauth?.accessTokenExpiresAt).toBe(12345);
+  });
+
   it('keeps remote keep-alive checks disabled by default', () => {
     const normalized = normalizeServerConfigForPersistence({
       type: 'streamable-http',
@@ -386,4 +395,104 @@ it.each([undefined, false, true])('round-trips HTTP OAuth exception=%s', (value)
     oauth: { allowInsecureTokenEndpoint: value },
   });
   expect(config.oauth?.allowInsecureTokenEndpoint).toBe(value);
+});
+
+describe('upstream protocol negotiation configuration', () => {
+  it('rejects unknown modes and auto on transports without modern HTTP discovery', () => {
+    expect(() =>
+      normalizeServerConfigForPersistence({
+        type: 'streamable-http',
+        protocolNegotiation: 'bad',
+      } as any),
+    ).toThrow(/protocolNegotiation/);
+    expect(() =>
+      normalizeServerConfigForPersistence({
+        type: 'stdio',
+        command: 'node',
+        protocolNegotiation: 'auto',
+      } as any),
+    ).toThrow(/streamable-http/);
+  });
+});
+
+describe('explicit OAuth authorization server metadata', () => {
+  const metadata = {
+    issuer: 'https://login.example.com/tenant',
+    authorization_endpoint: 'https://login.example.com/authorize',
+    token_endpoint: 'https://login.example.com/token',
+    response_types_supported: ['code'],
+    code_challenge_methods_supported: ['S256'],
+    authorization_response_iss_parameter_supported: true,
+  };
+  it('preserves metadata through persistence without changing legacy endpoint fields', () => {
+    const config = normalizeServerConfigForPersistence({
+      type: 'streamable-http',
+      url: 'http://internal.example/mcp',
+      oauth: {
+        identityMode: 'personal',
+        clientId: 'client',
+        authorizationServerMetadata: metadata,
+      },
+    });
+    expect(config.oauth?.authorizationServerMetadata).toEqual(metadata);
+    expect(config.oauth).not.toHaveProperty('authorizationEndpoint');
+  });
+  it.each([
+    { issuer: 'https://login.example.com?tenant=1' },
+    { authorization_endpoint: 'javascript:alert(1)' },
+    { token_endpoint: 'https://user:secret@login.example.com/token' },
+    { token_endpoint: 'https://login.example.com/token#fragment' },
+    { token_endpoint: undefined },
+    { response_types_supported: 'code' },
+    { authorization_response_iss_parameter_supported: 'true' },
+  ])('rejects invalid metadata %p', (invalid) => {
+    expect(() =>
+      normalizeServerConfigForPersistence({
+        type: 'streamable-http',
+        url: 'http://internal.example/mcp',
+        oauth: {
+          authorizationServerMetadata: { ...metadata, ...invalid } as unknown as NonNullable<
+            ServerConfig['oauth']
+          >['authorizationServerMetadata'],
+        },
+      }),
+    ).toThrow('Invalid oauth.authorizationServerMetadata');
+  });
+});
+
+describe('authorization relay configuration', () => {
+  const oauth = {
+    identityMode: 'personal' as const,
+    authorizationServerMetadata: {
+      issuer: 'http://broker.internal',
+      authorization_endpoint: 'http://broker.internal/authorize',
+      token_endpoint: 'http://broker.internal/token',
+      response_types_supported: ['code'],
+    },
+    authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com'] },
+  };
+  it('preserves relay settings', () => {
+    const normalized = normalizeServerConfigForPersistence({
+      type: 'streamable-http',
+      url: 'http://broker.internal/mcp',
+      oauth,
+    });
+    expect(normalized.oauth?.authorizationRelay).toEqual(oauth.authorizationRelay);
+  });
+  it.each([
+    { identityMode: 'shared' },
+    { authorizationServerMetadata: undefined },
+    { authorizationRelay: true },
+    { authorizationRelay: { allowedRedirectOrigins: [] } },
+    { authorizationRelay: { allowedRedirectOrigins: ['http://login.example.com'] } },
+    { authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com/path'] } },
+  ])('rejects invalid relay declaration %j', (invalid) => {
+    expect(() =>
+      normalizeServerConfigForPersistence({
+        type: 'streamable-http',
+        url: 'http://broker.internal/mcp',
+        oauth: { ...oauth, ...invalid } as typeof oauth,
+      }),
+    ).toThrow('Invalid oauth.authorizationRelay');
+  });
 });

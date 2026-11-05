@@ -29,6 +29,14 @@ describe('SystemConfigDaoImpl smart-routing migration', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  it('persists dashboard branding across reads and clears it without losing other settings', async () => {
+    writeSettings(settingsPath, { mcpServers: {}, systemConfig: { nameSeparator: '::' } });
+    await new SystemConfigDaoImpl().update({ dashboardName: 'Team MCP' });
+    expect((await new SystemConfigDaoImpl().get()).dashboardName).toBe('Team MCP');
+    await new SystemConfigDaoImpl().update({ dashboardName: '' });
+    expect(await new SystemConfigDaoImpl().get()).toMatchObject({ dashboardName: '', nameSeparator: '::' });
+  });
+
   it('persists and clears CIDR ranges without losing other settings', async () => {
     writeSettings(settingsPath, { mcpServers: {}, systemConfig: { nameSeparator: '::' } });
     const dao = new SystemConfigDaoImpl();
@@ -36,6 +44,28 @@ describe('SystemConfigDaoImpl smart-routing migration', () => {
     expect((await dao.get()).network?.allowedCidrs).toEqual(['192.168.1.0/24']);
     await dao.update({ network: { allowedCidrs: [] } });
     expect(await dao.get()).toMatchObject({ nameSeparator: '::', network: { allowedCidrs: [] } });
+  });
+
+  it('round-trips scoped Fake-IP exceptions', async () => {
+    writeSettings(settingsPath, { mcpServers: {}, systemConfig: {} });
+    const fakeIpExceptions = [{ serverId: 'trusted', hostname: 'mcp.example.com' }];
+    await new SystemConfigDaoImpl().update({ network: { fakeIpExceptions } });
+    expect((await new SystemConfigDaoImpl().get()).network?.fakeIpExceptions).toEqual(fakeIpExceptions);
+  });
+
+  it('round-trips policy rules, rejects malformed writes, and fails closed on unreadable configuration', async () => {
+    writeSettings(settingsPath, { mcpServers: {}, systemConfig: {} });
+    const dao = new SystemConfigDaoImpl();
+    const toolPolicies = [{ id: 'read', effect: 'allow' as const, keyId: 'key', tool: 'read' }];
+    await dao.update({ toolPolicies });
+    expect((await new SystemConfigDaoImpl().get({ failClosed: true })).toolPolicies).toEqual(
+      toolPolicies,
+    );
+    await expect(
+      dao.update({ toolPolicies: [{ id: 'bad', effect: 'typo' as 'allow' }] }),
+    ).rejects.toThrow('Invalid toolPolicies');
+    fs.writeFileSync(settingsPath, '{broken json');
+    await expect(new SystemConfigDaoImpl().get({ failClosed: true })).rejects.toThrow();
   });
 
   it('returns migrated settings when a read-only config rejects writeback', async () => {

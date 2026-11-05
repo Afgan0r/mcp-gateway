@@ -194,7 +194,8 @@ export interface ProxychainsConfig {
 }
 
 export interface CredentialSlot {
-  target: 'env' | 'headers' | 'args';
+  target: 'env' | 'headers' | 'args' | 'url';
+  allowed?: string[];
   name: string;
   label?: string;
 }
@@ -204,11 +205,13 @@ export interface MyCredentialBinding {
   credentialTemplate: CredentialSlot[];
   configured: boolean;
   configuredSlots: string[];
+  valuePreviews?: Record<string, string>;
   updatedAt: string | null;
 }
 
 // Server config types
 export interface ServerConfig {
+  id?: string;
   credentialTemplate?: CredentialSlot[];
   type?: 'stdio' | 'sse' | 'streamable-http' | 'openapi';
   description?: string;
@@ -221,9 +224,11 @@ export interface ServerConfig {
   enabled?: boolean;
   // Per-server visibility for non-admin users.
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
-  enableKeepAlive?: boolean; // Enable remote health checks and automatic reconnect attempts
-  keepAliveInterval?: number; // Health check and reconnect interval in milliseconds (default: 60000ms)
+  protocolNegotiation?: 'auto' | 'legacy'; // Streamable HTTP defaults to auto; other transports remain legacy.
+  enableKeepAlive?: boolean; // Enable remote health checks; disconnected remote servers always retry
+  keepAliveInterval?: number; // Health check interval in milliseconds (default: 60000ms)
   perSessionClient?: boolean; // Create a dedicated upstream client per downstream session instead of sharing one connection (for stateful servers like Playwright)
   // On-demand spawning: start the stdio process only when a tool call arrives,
   // and shut it down automatically after a period of inactivity (stdio only).
@@ -248,6 +253,7 @@ export interface ServerConfig {
     clientSecret?: string; // OAuth client secret
     redirectUri?: string; // Preferred redirect URI for authorization requests and registration
     scopes?: string[]; // Required OAuth scopes
+    accessTokenExpiresAt?: number;
     accessToken?: string; // Pre-obtained access token (if available)
     refreshToken?: string; // Refresh token for renewing access
     dynamicRegistration?: {
@@ -271,6 +277,20 @@ export interface ServerConfig {
       initialAccessToken?: string;
     };
     resource?: string; // OAuth resource parameter (RFC8707)
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
+    authorizationServerMetadata?: {
+      issuer: string;
+      authorization_endpoint: string;
+      token_endpoint: string;
+      response_types_supported: string[];
+      code_challenge_methods_supported?: string[];
+      token_endpoint_auth_methods_supported?: string[];
+      scopes_supported?: string[];
+      registration_endpoint?: string;
+      revocation_endpoint?: string;
+      authorization_response_iss_parameter_supported?: boolean;
+      [key: string]: unknown;
+    };
     authorizationEndpoint?: string; // Authorization endpoint (authorization code flow)
     tokenEndpoint?: string; // Token endpoint for exchanging authorization codes for tokens
     revocationEndpoint?: string; // Token revocation endpoint (RFC 7009)
@@ -331,11 +351,13 @@ export interface OpenAPISecurityConfig {
 // Server types
 export interface Server {
   name: string;
+  protocolVersion?: string;
   version?: string;
   owner?: string;
   visibility?: 'private' | 'group' | 'public';
   status: ServerStatus;
   error?: string;
+  recovery?: { attempts: number; lastAttemptAt?: number; nextAttemptAt?: number };
   tools?: Tool[];
   prompts?: Prompt[];
   resources?: Resource[];
@@ -360,6 +382,7 @@ export interface Server {
 export interface IGroupServerConfig {
   name: string; // Server name
   alias?: string; // Optional exposed name for this server within the group
+  preserveToolNames?: boolean; // Expose upstream tool names without a server prefix
   tools?: string[] | 'all'; // Array of specific tool names to include, or 'all' for all tools (default: 'all')
   prompts?: string[] | 'all'; // Array of specific prompt names to include, or 'all' for all prompts (default: 'all')
   resources?: string[] | 'all'; // Array of specific resource URIs to include, or 'all' for all resources (default: 'all')
@@ -369,6 +392,7 @@ export interface IGroupServerConfig {
 export interface Group {
   owner?: string;
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   id: string;
   name: string;
@@ -385,6 +409,7 @@ export interface EnvVar {
 
 // Form data types
 export interface ServerFormData {
+  protocolNegotiation?: 'auto' | 'legacy';
   credentialTemplate?: CredentialSlot[];
   name: string;
   description?: string;
@@ -398,6 +423,7 @@ export interface ServerFormData {
   passthroughHeaders?: string;
   // Visibility for non-admin users.
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   options?: {
     timeout?: number;
@@ -424,8 +450,11 @@ export interface ServerFormData {
     allowInsecureTokenEndpoint?: boolean;
     clientSecret?: string;
     scopes?: string;
+    accessTokenExpiresAt?: number;
     accessToken?: string;
     refreshToken?: string;
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
+    authorizationServerMetadata?: NonNullable<ServerConfig['oauth']>['authorizationServerMetadata'];
     authorizationEndpoint?: string;
     tokenEndpoint?: string;
     resource?: string;
@@ -486,6 +515,7 @@ export interface ServerFormData {
 // Group form data types
 export interface GroupFormData {
   visibility?: Group['visibility'];
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   name: string;
   description: string;
@@ -502,7 +532,7 @@ export interface ApiResponse<T = any> {
 }
 
 // Bearer authentication key configuration (frontend view model)
-export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom';
+export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom' | 'exclude';
 export type BearerKeyKind = 'system' | 'user';
 
 export interface BearerKey {
@@ -515,6 +545,8 @@ export interface BearerKey {
   accessType: BearerKeyAccessType;
   allowedGroups?: string[];
   allowedServers?: string[];
+  excludedGroups?: string[];
+  excludedServers?: string[];
 }
 
 // Auth types
@@ -526,6 +558,7 @@ export interface IUser {
 
 // User management types
 export interface User {
+  userGroups?: string[];
   username: string;
   isAdmin: boolean;
   email?: string;
@@ -539,6 +572,7 @@ export interface UserFormData {
 }
 
 export interface UserUpdateData {
+  userGroups?: string[];
   isAdmin?: boolean;
   newPassword?: string;
   email?: string;
@@ -792,6 +826,7 @@ export interface TemplateServerConfig {
   headers?: Record<string, string>;
   passthroughHeaders?: string[];
   enabled?: boolean;
+  protocolNegotiation?: 'auto' | 'legacy'; // Streamable HTTP defaults to auto; other transports remain legacy.
   enableKeepAlive?: boolean;
   keepAliveInterval?: number;
   tools?: Record<string, { enabled: boolean; description?: string }>;
@@ -828,6 +863,8 @@ export interface TemplateServerConfig {
       initialAccessToken?: string;
     };
     resource?: string;
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
+    authorizationServerMetadata?: NonNullable<ServerConfig['oauth']>['authorizationServerMetadata'];
     authorizationEndpoint?: string;
     tokenEndpoint?: string;
   };

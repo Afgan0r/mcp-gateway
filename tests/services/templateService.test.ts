@@ -149,6 +149,26 @@ describe('templateService', () => {
       ]);
     });
 
+    it('preserves explicit OAuth metadata in exported templates', async () => {
+      const authorizationServerMetadata = {
+        issuer: 'https://as.example.com',
+        authorization_endpoint: 'https://as.example.com/authorize',
+        token_endpoint: 'https://as.example.com/token',
+        response_types_supported: ['code'],
+        code_challenge_methods_supported: ['S256'],
+      };
+      mockServerDao.findAll.mockResolvedValue([
+        { name: 's1', type: 'streamable-http', url: 'https://private.example/mcp',
+          oauth: { clientId: 'client', identityMode: 'personal', authorizationServerMetadata,
+            authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com'] } } },
+      ]);
+      mockGroupDao.findAll.mockResolvedValue([{ id: 'g1', name: 'G', servers: ['s1'] }]);
+      const template = await exportTemplate({ name: 'Test' });
+      expect(template.servers.s1.oauth?.authorizationServerMetadata).toEqual(authorizationServerMetadata);
+      expect(template.servers.s1.oauth?.identityMode).toBe('personal');
+      expect(template.servers.s1.oauth?.authorizationRelay).toEqual({ allowedRedirectOrigins: ['https://login.example.com'] });
+    });
+
     it('should preserve existing ${PLACEHOLDER} patterns', async () => {
       mockServerDao.findAll.mockResolvedValue([
         { name: 's1', command: 'npx', env: { TOKEN: '${MY_TOKEN}', REGION: 'us-east-1' } },
@@ -499,7 +519,7 @@ describe('templateService', () => {
       expect(result.requiredEnvVars).toContain('API_KEY');
     });
 
-    it('should import expanded template server fields', async () => {
+    it('should import expanded fields while stripping fields for other transports', async () => {
       mockServerDao.findAll.mockResolvedValue([]);
       mockGroupDao.findByName.mockResolvedValue(null);
       mockAddServer.mockResolvedValue(undefined);
@@ -543,16 +563,13 @@ describe('templateService', () => {
       expect(mockAddServer).toHaveBeenCalledWith(
         's1',
         expect.objectContaining({
-          enableKeepAlive: true,
-          keepAliveInterval: 30000,
+          enableKeepAlive: undefined,
+          keepAliveInterval: undefined,
           proxy: expect.objectContaining({
             host: 'proxy.local',
             password: '${PROXY_PASSWORD}',
           }),
-          oauth: expect.objectContaining({
-            clientId: 'client-id',
-            clientSecret: '${OAUTH_CLIENT_SECRET}',
-          }),
+          oauth: undefined,
           openapi: expect.objectContaining({
             schema: expect.objectContaining({ openapi: '3.1.0' }),
           }),

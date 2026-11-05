@@ -1,3 +1,7 @@
+import { oauthServerMetadataSchema } from '../utils/oauthServerMetadata.js';
+import { isReplicaMode } from '../utils/replicaMode.js';
+import { withReplicaLock } from './replicaLock.js';
+import { expandServerConfig } from './serverConfigEnvironment.js';
 import * as sharedOAuthSettings from './oauthSettingsStore.js';
 import {
   personalOAuthContexts,
@@ -19,6 +23,7 @@ import {
  */
 
 import { randomBytes } from 'node:crypto';
+import { auth } from '../clients/mcpSdkClient.js';
 import type {
   OAuthClientProvider,
   OAuthDiscoveryState,
@@ -70,6 +75,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
   private _codeVerifier?: string;
   private _currentState?: string;
   private _systemInstallBaseUrl?: string;
+  private renewal?: Promise<void>;
 
   constructor(serverName: string, serverConfig: ServerConfig, systemInstallBaseUrl?: string) {
     this.personal = personalOAuthContexts.get(serverConfig);
@@ -233,7 +239,10 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
    * Get previously registered client information
    */
   clientInformation(): OAuthClientInformationWithAuthMethod | undefined {
-    const clientInfo = this.personal ? undefined : getRegisteredClient(this.serverName);
+    const clientInfo =
+      this.personal || this.serverConfig.oauth?.authorizationServerMetadata
+        ? undefined
+        : getRegisteredClient(this.serverName);
     // The SDK uses this hint when authorization-server metadata omits
     // token_endpoint_auth_methods_supported. Keep it alongside credentials so
     // refresh requests use the same authentication method that MCPHub selected
@@ -302,7 +311,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
   /**
    * Get stored OAuth tokens
    */
-  tokens(): OAuthTokens | undefined {
+  private storedTokens(): OAuthTokens | undefined {
     // Use cached config only (tokens are updated via saveTokens which updates cache)
     const serverConfig = this.serverConfig;
 
@@ -314,9 +323,78 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       access_token: serverConfig.oauth.accessToken,
       token_type: 'Bearer',
       refresh_token: serverConfig.oauth.refreshToken,
-      // Note: expires_in is not typically stored, only the token itself
-      // The SDK will handle token refresh when needed
+      ...(serverConfig.oauth.accessTokenExpiresAt !== undefined
+        ? {
+            expires_in: Math.max(
+              0,
+              Math.floor((serverConfig.oauth.accessTokenExpiresAt - Date.now()) / 1000),
+            ),
+          }
+        : {}),
     };
+  }
+
+  async tokens(): Promise<OAuthTokens | undefined> {
+    if (isReplicaMode()) {
+      const latest = await this.settings.loadServerConfig(this.serverName);
+      if (!latest) return undefined;
+      this.serverConfig = await expandServerConfig(latest);
+    }
+    const oauth = this.serverConfig.oauth;
+    if (
+      !oauth?.accessToken ||
+      oauth.accessTokenExpiresAt === undefined ||
+      oauth.accessTokenExpiresAt > Date.now()
+    )
+      return this.storedTokens();
+    if (!oauth.refreshToken) {
+      throw new Error('OAuth access token expired; reconnect');
+    }
+    if (!this.renewal) {
+      const renew = async () => {
+        if (!this.serverConfig.url) throw new Error('Missing OAuth resource URL');
+        // SDK issuer annotation re-saves tokens; do not turn remaining lifetime into a new expiry.
+        const provider = new Proxy(this, {
+          get: (target, property) => {
+            if (property === 'tokens') return () => {
+              const stored = this.storedTokens();
+              if (!stored) return undefined;
+              const { expires_in: _expiry, ...tokens } = stored;
+              return tokens;
+            };
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        const fetchFn = await createOAuthFetch(this.serverConfig);
+        const result = await auth(provider, {
+          serverUrl: this.serverConfig.url,
+          fetchFn: this.personal?.wrapFetch(fetchFn) ?? fetchFn,
+        });
+        if (result !== 'AUTHORIZED') throw new Error('OAuth authorization required; reconnect');
+      };
+      this.renewal = withReplicaLock(
+        JSON.stringify(['oauth', this.serverName, this.personal?.username || 'shared']),
+        async () => {
+          if (isReplicaMode() && !this.personal) {
+            const latest = await this.settings.loadServerConfig(this.serverName);
+            if (!latest) throw new Error('Server no longer exists');
+            this.serverConfig = await expandServerConfig(latest);
+            const expiry = this.serverConfig.oauth?.accessTokenExpiresAt;
+            if (expiry === undefined || expiry > Date.now()) return;
+          }
+          await (this.personal ? this.personal.renewTokens(renew) : renew());
+        },
+      );
+    }
+    const renewal = this.renewal;
+    try {
+      await renewal;
+      if (this.personal) this.serverConfig = this.personal.config;
+      return this.storedTokens();
+    } finally {
+      if (this.renewal === renewal) this.renewal = undefined;
+    }
   }
 
   /**
@@ -324,14 +402,28 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
    * Called by SDK after successful token exchange or refresh
    */
   async saveTokens(tokens: OAuthTokens): Promise<void> {
+    if (
+      tokens.expires_in !== undefined &&
+      (!Number.isFinite(tokens.expires_in) || tokens.expires_in < 0)
+    )
+      throw new Error('Invalid OAuth token expiry');
     const currentOAuth = this.serverConfig.oauth;
     const accessTokenChanged = currentOAuth?.accessToken !== tokens.access_token;
+    const accessTokenExpiresAt =
+      tokens.expires_in !== undefined
+        ? Date.now() + tokens.expires_in * 1000
+        : accessTokenChanged
+          ? null
+          : undefined;
+    const expiryChanged =
+      accessTokenExpiresAt !== undefined &&
+      currentOAuth?.accessTokenExpiresAt !== (accessTokenExpiresAt ?? undefined);
     const refreshTokenProvided = tokens.refresh_token !== undefined;
     const refreshTokenChanged =
       refreshTokenProvided && currentOAuth?.refreshToken !== tokens.refresh_token;
     const hadPending = Boolean(currentOAuth?.pendingAuthorization);
 
-    if (!accessTokenChanged && !refreshTokenChanged && !hadPending) {
+    if (!accessTokenChanged && !refreshTokenChanged && !expiryChanged && !hadPending) {
       return;
     }
 
@@ -343,6 +435,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
 
     const updatedConfig = await this.settings.persistTokens(this.serverName, {
       accessToken: tokens.access_token,
+      accessTokenExpiresAt,
       refreshToken: refreshTokenProvided ? (tokens.refresh_token ?? null) : undefined,
       clearPendingAuthorization: hadPending,
     });
@@ -387,7 +480,20 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       this.serverConfig = storedConfig;
       this.saveDiscoveryState(state);
     }
-    return state;
+    if (state) return state;
+
+    const configured = this.serverConfig.oauth?.authorizationServerMetadata;
+    if (configured !== undefined) {
+      const metadata = oauthServerMetadataSchema.parse(configured);
+      // Seed the authority only; the SDK still discovers and validates the MCP resource.
+      const override: OAuthDiscoveryState = {
+        authorizationServerUrl: metadata.issuer,
+        authorizationServerMetadata: metadata,
+      };
+      this.saveDiscoveryState(override);
+      return override;
+    }
+    return undefined;
   }
 
   /**
@@ -673,7 +779,7 @@ const hasAuthorizationHeader = (headers?: Record<string, string>): boolean => {
  * @param serverConfig - Server configuration
  * @returns OAuthClientProvider instance or undefined if OAuth not configured
  */
-export const createOAuthProvider = async (
+const createOAuthProviderUnlocked = async (
   serverName: string,
   serverConfig: ServerConfig,
 ): Promise<OAuthClientProvider | undefined> => {
@@ -693,6 +799,7 @@ export const createOAuthProvider = async (
         oauth.clientId ||
         oauth.accessToken ||
         oauth.refreshToken ||
+        oauth.authorizationServerMetadata ||
         oauth.authorizationEndpoint ||
         oauth.tokenEndpoint ||
         oauth.dynamicRegistration?.enabled ||
@@ -722,3 +829,11 @@ export const createOAuthProvider = async (
   logger.log('Created OAuth provider', JSON.stringify({ serverName }));
   return provider;
 };
+
+export const createOAuthProvider = (
+  name: string,
+  definition: ServerConfig,
+): Promise<OAuthClientProvider | undefined> => withReplicaLock(
+  JSON.stringify(['oauth', name, personalOAuthContexts.get(definition)?.username || 'shared']),
+  () => createOAuthProviderUnlocked(name, definition),
+);

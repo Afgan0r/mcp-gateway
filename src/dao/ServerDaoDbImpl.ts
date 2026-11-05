@@ -104,9 +104,11 @@ export class ServerDaoDbImpl implements ServerDao {
       enabled: entity.enabled !== undefined ? entity.enabled : true,
       owner: entity.owner,
       visibility: entity.visibility ?? 'private',
+      sharedWithUserGroups: entity.sharedWithUserGroups,
       sharedWithUsers: entity.sharedWithUsers,
       enableKeepAlive: entity.enableKeepAlive,
       keepAliveInterval: entity.keepAliveInterval,
+      protocolNegotiation: entity.protocolNegotiation,
       tools: entity.tools,
       prompts: entity.prompts,
       resources: entity.resources,
@@ -158,10 +160,12 @@ export class ServerDaoDbImpl implements ServerDao {
     assignNullable('owner');
     assign('visibility');
     assignNullable('sharedWithUsers');
+    assignNullable('sharedWithUserGroups');
     if (hasOwn('enableKeepAlive')) {
       updateData.enableKeepAlive = entity.enableKeepAlive ?? false;
     }
     assignNullable('keepAliveInterval');
+    assignNullable('protocolNegotiation');
     assignNullable('tools');
     assignNullable('prompts');
     assignNullable('resources');
@@ -289,6 +293,7 @@ export class ServerDaoDbImpl implements ServerDao {
   }
 
   private mapToServerConfig(server: {
+    id?: string;
     name: string;
     type?: string;
     catalogMode?: 'persistent';
@@ -302,6 +307,7 @@ export class ServerDaoDbImpl implements ServerDao {
     enabled: boolean;
     owner?: string;
     visibility?: 'private' | 'group' | 'public';
+    sharedWithUserGroups?: string[];
     sharedWithUsers?: string[];
     enableKeepAlive?: boolean;
     keepAliveInterval?: number;
@@ -313,6 +319,7 @@ export class ServerDaoDbImpl implements ServerDao {
     proxy?: Record<string, any>;
     openapi?: Record<string, any>;
     passthroughHeaders?: string[];
+    protocolNegotiation?: ServerConfig['protocolNegotiation'];
     perSessionClient?: boolean;
     inheritEnv?: boolean;
     credentialTemplate?: ServerConfig['credentialTemplate'];
@@ -328,6 +335,7 @@ export class ServerDaoDbImpl implements ServerDao {
     );
 
     return {
+      id: server.id,
       name: server.name,
       type: server.type as 'stdio' | 'sse' | 'streamable-http' | 'openapi' | undefined,
       catalogMode: server.catalogMode,
@@ -341,9 +349,11 @@ export class ServerDaoDbImpl implements ServerDao {
       enabled: server.enabled,
       owner: server.owner,
       visibility: server.visibility ?? 'private',
+      sharedWithUserGroups: server.sharedWithUserGroups,
       sharedWithUsers: server.sharedWithUsers,
       enableKeepAlive: server.enableKeepAlive,
       keepAliveInterval: server.keepAliveInterval,
+      protocolNegotiation: server.protocolNegotiation ?? undefined,
       tools: server.tools,
       prompts: server.prompts,
       resources: server.resources,

@@ -181,7 +181,7 @@ test('upserts by name, retains IDs and unrelated entries, clears removed fields 
   groups.set('team', { id: 'existing-group', name: 'team', owner: 'old-owner' });
   write({
     mcpServers: { remote, local: { command: 'node', startOnDemand: true, idleTimeoutMs: 1000 } },
-    groups: [{ name: 'team', servers: [{ name: 'remote', alias: 'r', tools: ['search'] }] }],
+    groups: [{ name: 'team', servers: [{ name: 'remote', alias: 'r', preserveToolNames: true, tools: ['search'] }] }],
     users: [{ username: 'ignored' }],
     bearerKeys: ['ignored'],
     systemConfig: { routing: {} },
@@ -204,7 +204,7 @@ test('upserts by name, retains IDs and unrelated entries, clears removed fields 
   expect(groups.get('team')).toMatchObject({
     id: 'existing-group',
     owner: null,
-    servers: [{ name: 'remote', alias: 'r', tools: ['search'] }],
+    servers: [{ name: 'remote', alias: 'r', preserveToolNames: true, tools: ['search'] }],
   });
   const snapshot = [...servers.entries()];
   await syncSettingsToDatabase();
@@ -662,4 +662,34 @@ test('prune first boot skips legacy seeds and never writes to the settings file'
   } finally {
     writeSpy.mockRestore();
   }
+});
+
+it('round-trips the upstream protocol override and clears it back to automatic negotiation', async () => {
+  write({ mcpServers: { remote: { ...remote, protocolNegotiation: 'legacy' } } });
+  await syncSettingsToDatabase('upsert');
+  const dao = new ServerDaoDbImpl();
+  expect((await dao.findById('remote'))?.protocolNegotiation).toBe('legacy');
+  write({ mcpServers: { remote: { ...remote, protocolNegotiation: 'auto' } } });
+  await syncSettingsToDatabase('upsert');
+  expect((await dao.findById('remote'))?.protocolNegotiation).toBe('auto');
+  write({ mcpServers: { remote } });
+  await syncSettingsToDatabase('upsert');
+  expect((await dao.findById('remote'))?.protocolNegotiation).toBeUndefined();
+});
+
+test('warns when a declaration ID conflicts with the retained database identity', async () => {
+  const warn = jest.spyOn(logger, 'warn');
+  servers.set('remote', { id: '11111111-1111-4111-8111-111111111111', name: 'remote', ...remote });
+  write({ mcpServers: { remote: { ...remote, id: '22222222-2222-4222-8222-222222222222' } } });
+  await syncSettingsToDatabase();
+  expect(servers.get('remote')?.id).toBe('11111111-1111-4111-8111-111111111111');
+  expect(warn).toHaveBeenCalledWith(
+    expect.stringContaining('ignoring declared ID'),
+    expect.objectContaining({
+      serverName: 'remote',
+      declaredId: '22222222-2222-4222-8222-222222222222',
+      retainedId: '11111111-1111-4111-8111-111111111111',
+    }),
+  );
+  warn.mockRestore();
 });

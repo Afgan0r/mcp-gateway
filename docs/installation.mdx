@@ -7,7 +7,7 @@ description: 'Detailed installation instructions for all platforms'
 
 Before installing MCPHub, ensure you have the following prerequisites:
 
-- **Node.js** 20+ (for local development)
+- **Node.js** 22+ (for local development)
 - **Docker** (recommended for production)
 - **pnpm** (for local development)
 
@@ -252,6 +252,8 @@ Optional for Smart Routing:
   <Tab title="Kubernetes">
     ### Kubernetes Deployment
 
+    For multiple replicas sharing PostgreSQL, follow the [Kubernetes replica deployment guide](/configuration/replicas#deploy-on-kubernetes). The example below runs one file-backed instance.
+
     Deploy MCPHub on Kubernetes with these manifests:
 
     #### 1. ConfigMap for Settings
@@ -383,6 +385,18 @@ Optional for Smart Routing:
     kubectl apply -f mcphub-service.yaml
     kubectl apply -f mcphub-ingress.yaml
     ```
+
+  </Tab>
+  <Tab title="Home Assistant (Community)">
+    ### Home Assistant App
+
+    MCPHub is available as a community-maintained app for Home Assistant OS and
+    Supervised installations. It is not maintained by the MCPHub project, so please
+    report app-specific problems in the app's repository.
+
+    [Add the repository to Home Assistant](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FHyperCriSiS%2FHome-Assistant-Apps),
+    install **MCPHub** and start it. Setup and configuration are described in the
+    [app documentation](https://github.com/HyperCriSiS/Home-Assistant-Apps/tree/main/MCPHub).
 
   </Tab>
 </Tabs>
@@ -540,9 +554,9 @@ curl -X POST http://localhost:3000/mcp \
     # Check Node version
     node --version
 
-    # Install Node 20+ using nvm
-    nvm install 20
-    nvm use 18
+    # Install Node 22+ using nvm
+    nvm install 22
+    nvm use 22
     ```
 
   </Accordion>

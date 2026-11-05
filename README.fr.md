@@ -46,6 +46,7 @@ MCPHub offre une manière unifiée de connecter et de gérer plusieurs serveurs 
 - **Tableau de bord Web** - Gérez la configuration et le fonctionnement des serveurs depuis un navigateur
 - **Compression des résultats d'outils** - Réduisez automatiquement les grands résultats texte avant qu'ils n'atteignent les clients
 - **Mode Base de données** - Stockez la configuration dans PostgreSQL pour les environnements de production ([En savoir plus](https://docs.mcphub.app/configuration/database-configuration))
+- **Plusieurs réplicas** - Partagez la configuration PostgreSQL avec affinité des sessions et reconnexion après panne ([Guide](https://docs.mcphub.app/configuration/replicas))
 - **Prêt pour Docker** - Déployez instantanément avec la configuration conteneurisée
 
 ## 🔧 Démarrage rapide
@@ -53,7 +54,7 @@ MCPHub offre une manière unifiée de connecter et de gérer plusieurs serveurs 
 ### Prérequis
 
 - **Docker** (recommandé) — le moyen le plus rapide d'exécuter MCPHub ; toutes les commandes ci-dessous l'utilisent
-- **Node.js** `>=20.0.0` et **pnpm** `12.14.0` — uniquement pour exécuter depuis les sources ou développer localement (voir [Développement local](#développement-local))
+- **Node.js** `>=22.0.0` et **pnpm** `12.14.0` — uniquement pour exécuter depuis les sources ou développer localement (voir [Développement local](#développement-local))
 
 ### Démarrer avec Docker
 

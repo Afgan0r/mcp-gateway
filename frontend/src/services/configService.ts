@@ -2,13 +2,17 @@ import { apiGet, fetchWithInterceptors } from '../utils/fetchInterceptor';
 import { getBasePath } from '../utils/runtime';
 
 export interface SystemConfig {
+  dashboardName?: string;
+  toolPolicies?: import('../../../src/types/toolPolicy.js').ToolPolicyRule[];
   routing?: {
     enableGlobalRoute?: boolean;
     enableGroupNameRoute?: boolean;
     enableBearerAuth?: boolean;
     bearerAuthKey?: string;
     bearerAuthHeaderName?: string;
+    allowAuthorizationPassthrough?: boolean; // Admin opt-in; requires a separate MCPHub auth header.
     jsonBodyLimit?: string;
+    dashboardName?: string;
     skipAuth?: boolean;
   };
   install?: {
@@ -94,6 +98,7 @@ interface BetterAuthConfig {
 export interface PublicConfigResponse {
   success: boolean;
   data?: {
+    dashboardName?: string;
     skipAuth?: boolean;
     allowRegistration?: boolean;
     permissions?: any;
@@ -114,6 +119,7 @@ export interface SystemConfigResponse {
  * Get public configuration (skipAuth setting) without authentication
  */
 export const getPublicConfig = async (): Promise<{
+  dashboardName?: string;
   skipAuth: boolean;
   allowRegistration?: boolean;
   permissions?: any;
@@ -131,6 +137,7 @@ export const getPublicConfig = async (): Promise<{
     if (response.ok) {
       const data: PublicConfigResponse = await response.json();
       return {
+        dashboardName: data.data?.dashboardName,
         skipAuth: data.data?.skipAuth === true,
         allowRegistration: data.data?.allowRegistration === true,
         permissions: data.data?.permissions || {},

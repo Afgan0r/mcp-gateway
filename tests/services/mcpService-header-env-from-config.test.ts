@@ -1,3 +1,8 @@
+const mockDnsAddresses = ['198.18.0.1'];
+jest.mock('node:dns/promises', () => ({ lookup: jest.fn(async () => mockDnsAddresses.map(address => ({address}))) }));
+jest.mock('../../src/utils/systemConfigCache.js', () => ({
+  getCachedSystemConfig: () => ({network: {fakeIpExceptions: [{serverId: 'trusted', hostname: 'mcp.example.com'}]}}),
+}));
 import { SSEClientTransport, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
 const mockBaseFetch = jest.fn();
@@ -174,4 +179,48 @@ describe('MCP Service - header env var expansion from server config', () => {
       expect(JSON.stringify(options.requestInit.headers)).not.toContain('synthetic-hub-secret');
     },
   );
+});
+
+describe.each(['sse', 'streamable-http'] as const)('%s personal URL SSRF protection', (type) => {
+  test('does not inherit the admin internal-network exemption', async () => {
+    await expect(
+      createTransportFromConfig('regional', {
+        type,
+        owner: 'admin',
+        url: 'http://127.0.0.1/mcp',
+        credentialTemplate: [{ target: 'url', name: 'region', allowed: ['us'] }],
+      }),
+    ).rejects.toThrow('Blocked target IP');
+  });
+
+  test('validates redirects for admin-owned personal URL slots', async () => {
+    await createTransportFromConfig('regional', {
+      type,
+      owner: 'admin',
+      url: 'https://8.8.8.8/mcp',
+      credentialTemplate: [{ target: 'url', name: 'region', allowed: ['us'] }],
+    });
+    mockBaseFetch.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: { location: 'http://127.0.0.1/metadata' },
+      }),
+    );
+    const transport = type === 'sse' ? SSEClientTransport : StreamableHTTPClientTransport;
+    const options = (transport as jest.Mock).mock.calls.at(-1)[1];
+    const fetch = type === 'sse' ? options.eventSourceInit.fetch : options.fetch;
+    await expect(fetch('https://8.8.8.8/mcp')).rejects.toThrow('Blocked target IP');
+  });
+});
+
+it.each(['sse', 'streamable-http'])('applies scoped Fake-IP policy to %s transport and its fetch', async (type) => {
+  mockBaseFetch.mockResolvedValue(new Response('ok'));
+  const transport = await createTransportFromConfig('trusted-name', {
+    id: 'trusted', type, url: 'https://mcp.example.com/mcp',
+  });
+  await expect(transport.options.fetch('https://mcp.example.com/mcp')).resolves.toBeDefined();
+  await expect(transport.options.fetch('https://other.example.com/mcp')).rejects.toThrow();
+  await expect(createTransportFromConfig('untrusted-name', {
+    id: 'other', type, url: 'https://mcp.example.com/mcp',
+  })).rejects.toThrow();
 });

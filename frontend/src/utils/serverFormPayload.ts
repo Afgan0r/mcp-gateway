@@ -106,7 +106,11 @@ const buildOAuthConfig = (
       nextOAuth.scopes = parsedScopes;
     }
   }
-  if (accessToken && oauth.identityMode !== 'personal') nextOAuth.accessToken = accessToken;
+  if (accessToken && oauth.identityMode !== 'personal') {
+    nextOAuth.accessToken = accessToken;
+    if (oauth.accessTokenExpiresAt !== undefined)
+      nextOAuth.accessTokenExpiresAt = oauth.accessTokenExpiresAt;
+  }
   if (refreshToken && oauth.identityMode !== 'personal') nextOAuth.refreshToken = refreshToken;
   if (authorizationEndpoint) nextOAuth.authorizationEndpoint = authorizationEndpoint;
   if (tokenEndpoint) nextOAuth.tokenEndpoint = tokenEndpoint;
@@ -121,6 +125,10 @@ const buildOAuthConfig = (
   // declared once on `ServerFormData['oauth']` (frontend/src/types/index.ts),
   // so they can be read directly here; a key is only emitted when the form
   // actually carries it.
+  if (oauth.authorizationRelay) nextOAuth.authorizationRelay = oauth.authorizationRelay;
+  if (oauth.authorizationServerMetadata) {
+    nextOAuth.authorizationServerMetadata = oauth.authorizationServerMetadata;
+  }
   if (oauth.dynamicRegistration) {
     nextOAuth.dynamicRegistration = oauth.dynamicRegistration;
   }
@@ -250,11 +258,22 @@ export const buildServerPayload = ({
     description,
     options,
     visibility: formData.visibility ?? 'private',
+    sharedWithUserGroups:
+      formData.visibility === 'group'
+        ? normalizeSharedUsers(formData.sharedWithUserGroups)
+        : undefined,
     sharedWithUsers:
       formData.visibility === 'group' ? normalizeSharedUsers(formData.sharedWithUsers) : undefined,
     credentialTemplate: formData.credentialTemplate?.map((slot) => ({
       ...slot,
-      target: serverType === 'stdio' ? (slot.target === 'args' ? 'args' : 'env') : 'headers',
+      target:
+        serverType === 'stdio'
+          ? slot.target === 'args'
+            ? 'args'
+            : 'env'
+          : slot.target === 'url'
+            ? 'url'
+            : 'headers',
     })),
     perSessionClient: formData.perSessionClient === true ? true : undefined,
     startOnDemand: formData.startOnDemand === true ? true : undefined,
@@ -273,6 +292,8 @@ export const buildServerPayload = ({
   } else if (serverType === 'sse' || serverType === 'streamable-http') {
     const keepAliveEnabled = formData.keepAlive?.enabled === true;
 
+    config.protocolNegotiation =
+      serverType === 'streamable-http' ? formData.protocolNegotiation : undefined;
     config.url = formData.url.trim();
     config.env = env;
     config.headers = headers;

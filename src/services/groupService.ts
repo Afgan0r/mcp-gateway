@@ -1,11 +1,22 @@
 import { randomUUID } from 'node:crypto';
 import { validateGroupAccess } from '../utils/groupAccess.js';
 import { IGroup, IGroupServerConfig } from '../types/index.js';
-import { notifyToolChanged } from './mcpService.js';
+import {
+  broadcastToolListChanged,
+  broadcastPromptListChanged,
+  broadcastResourceListChanged,
+} from './mcpService.js';
 import { getDataService } from './services.js';
 import { UserContextService } from './userContextService.js';
 import { getGroupDao, getServerDao, getSystemConfigDao } from '../dao/index.js';
 import { logger } from '../utils/logger.js';
+
+// Group edits change capability exposure, not upstream connection configuration.
+const broadcastGroupListsChanged = (): void => {
+  broadcastToolListChanged();
+  broadcastPromptListChanged();
+  broadcastResourceListChanged();
+};
 
 // Helper function to normalize group servers configuration
 export const normalizeGroupServers = (
@@ -26,6 +37,7 @@ export const normalizeGroupServers = (
     return {
       name: server.name,
       ...(alias ? { alias } : {}),
+      ...(server.preserveToolNames === true ? { preserveToolNames: true } : {}),
       tools: server.tools || 'all',
       prompts: server.prompts || 'all',
       resources: server.resources || 'all',
@@ -146,7 +158,10 @@ export const createGroup = async (
   description?: string,
   servers: string[] | IGroupServerConfig[] = [],
   owner?: string,
-  access: Pick<IGroup, 'visibility' | 'sharedWithUsers' | 'instructions'> = {},
+  access: Pick<
+    IGroup,
+    'visibility' | 'sharedWithUsers' | 'sharedWithUserGroups' | 'instructions'
+  > = {},
 ): Promise<IGroup | null> => {
   try {
     const groupDao = getGroupDao();
@@ -173,6 +188,9 @@ export const createGroup = async (
       owner: owner || 'admin',
       visibility: access.visibility ?? 'private',
       sharedWithUsers: [...new Set(access.sharedWithUsers?.map((name) => name.trim()) || [])],
+      sharedWithUserGroups: [
+        ...new Set(access.sharedWithUserGroups?.map((name) => name.trim()) || []),
+      ],
     };
 
     const createdGroup = await groupDao.create(newGroup);
@@ -211,10 +229,15 @@ export const updateGroup = async (id: string, data: Partial<IGroup>): Promise<IG
       }
     }
 
-    const updatedGroup = await groupDao.update(id, data);
+    // A rename also moves bearer key scopes to the new name in the same atomic write, and
+    // is rejected if the new name equals a group ID (keys match groups by name or ID).
+    const renamed = data.name !== undefined && data.name !== existingGroup.name;
+    const updatedGroup = renamed
+      ? await groupDao.updateWithKeyScopes(id, data)
+      : await groupDao.update(id, data);
 
     if (updatedGroup) {
-      notifyToolChanged();
+      broadcastGroupListsChanged();
     }
 
     return updatedGroup;
@@ -246,7 +269,7 @@ export const updateGroupServers = async (
     const updatedGroup = await groupDao.update(groupId, { servers: validServers });
 
     if (updatedGroup) {
-      notifyToolChanged();
+      broadcastGroupListsChanged();
     }
 
     return updatedGroup;
@@ -301,13 +324,12 @@ export const addServerToGroup = async (
       const updatedGroup = await groupDao.update(groupId, { servers: normalizedServers });
 
       if (updatedGroup) {
-        notifyToolChanged();
+        broadcastGroupListsChanged();
       }
 
       return updatedGroup;
     }
 
-    notifyToolChanged();
     return group;
   } catch (error) {
     logger.error(`Failed to add server ${serverName} to group ${groupId}:`, error);
@@ -337,7 +359,7 @@ export const removeServerFromGroup = async (
     const updatedGroup = await groupDao.update(groupId, { servers: filteredServers });
 
     if (updatedGroup) {
-      notifyToolChanged();
+      broadcastGroupListsChanged();
     }
 
     return updatedGroup;
@@ -417,7 +439,7 @@ export const updateServerToolsInGroup = async (
     const updatedGroup = await groupDao.update(groupId, { servers: normalizedServers });
 
     if (updatedGroup) {
-      notifyToolChanged();
+      broadcastToolListChanged();
     }
 
     return updatedGroup;

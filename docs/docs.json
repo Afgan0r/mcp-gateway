@@ -38,8 +38,10 @@
               "configuration/mcp-settings",
               "configuration/environment-variables",
               "configuration/docker-setup",
+              "configuration/credential-key-upgrade",
               "configuration/nginx",
-              "configuration/database-configuration"
+              "configuration/database-configuration",
+              "configuration/replicas"
             ]
           },
           {
@@ -82,8 +84,10 @@
               "zh/configuration/mcp-settings",
               "zh/configuration/environment-variables",
               "zh/configuration/docker-setup",
+              "zh/configuration/credential-key-upgrade",
               "zh/configuration/nginx",
-              "zh/configuration/database-configuration"
+              "zh/configuration/database-configuration",
+              "zh/configuration/replicas"
             ]
           }
         ]

@@ -1,8 +1,12 @@
+import { legacyServerId } from './serverIdentity.js';
+import { isReplicaMode } from './replicaMode.js';
+import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { toStoredToken } from './bearerKeyToken.js';
 import { assertSmartRoutingSettingsAvailable } from './smartRoutingPath.js';
 import { syncSettingsToDatabase } from './settingsSync.js';
-import { CredentialBindingDaoImpl } from '../dao/CredentialBindingDao.js';
-import { CredentialBindingDaoDbImpl } from '../dao/CredentialBindingDaoDbImpl.js';
-import { loadOriginalSettings } from '../config/index.js';
+import { migrateCredentialBindings } from './credentialBindingMigration.js';
+import { getSettingsPath, loadOriginalSettings } from '../config/index.js';
 import { initializeDatabase } from '../db/connection.js';
 import { setDaoFactory } from '../dao/DaoFactory.js';
 import { DatabaseDaoFactory } from '../dao/DatabaseDaoFactory.js';
@@ -19,6 +23,55 @@ import { BuiltinResourceRepository } from '../db/repositories/BuiltinResourceRep
 import { logger } from './logger.js';
 
 /**
+ * Replace usable bearer tokens left in the source settings file with their hashed form
+ * (the format file mode already uses). Never fails the migration: the database copy is done.
+ */
+function scrubSourceFileSecrets(): void {
+  let settingsPath = '';
+  try {
+    settingsPath = getSettingsPath();
+    const raw = JSON.parse(fs.readFileSync(settingsPath, 'utf8').replace(/^\uFEFF/, ''));
+    const routing = raw.systemConfig?.routing;
+    const legacyKey: string = (routing?.bearerAuthKey || '').trim();
+    const hasRawKeys =
+      Array.isArray(raw.bearerKeys) && raw.bearerKeys.some((k: any) => k.token && !k.tokenHash);
+    if (!hasRawKeys && !routing?.bearerAuthKey) return;
+
+    // an existing array (even empty) is authoritative, as in BearerKeyDaoImpl.loadKeysWithMigration()
+    if (Array.isArray(raw.bearerKeys)) {
+      for (const key of raw.bearerKeys) {
+        if (key.token && !key.tokenHash) {
+          Object.assign(key, toStoredToken(key.token));
+          delete key.token;
+        }
+      }
+    } else if (legacyKey) {
+      // same conversion as the file DAO's legacy migration
+      raw.bearerKeys = [
+        {
+          id: randomUUID(),
+          name: 'default',
+          ...toStoredToken(legacyKey),
+          enabled: !!routing.enableBearerAuth,
+          kind: 'system',
+          accessType: 'all',
+          allowedGroups: [],
+          allowedServers: [],
+        },
+      ];
+    }
+    if (routing) routing.bearerAuthKey = '';
+    fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2), 'utf8');
+    logger.log('  - Replaced plaintext bearer tokens in the source settings file with hashes');
+  } catch (error) {
+    logger.warn(
+      `Migration succeeded, but plaintext bearer tokens may remain in ${settingsPath || 'the settings file'} ` +
+        `(could not rewrite it: ${error instanceof Error ? error.message : error}). Remove them manually.`,
+    );
+  }
+}
+
+/**
  * Migrate from file-based configuration to database
  */
 export async function migrateToDatabase(seedServersAndGroups = true): Promise<boolean> {
@@ -28,6 +81,9 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
     // Initialize database connection
     await initializeDatabase();
     logger.log('Database connection established');
+
+    // Validate/import credentials before any configuration writes.
+    await migrateCredentialBindings();
 
     // Load current settings from file
     const settings = loadOriginalSettings(
@@ -60,6 +116,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             isAdmin: user.isAdmin || false,
             email: user.email ?? null,
             ssoUserId: (user as any).ssoUserId ?? null,
+            userGroups: user.userGroups,
           });
           logger.log(`  - Created user: ${user.username}`);
         } else {
@@ -89,6 +146,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
           };
 
           await serverRepo.create({
+            id: config.id ?? legacyServerId(name),
             name,
             type: config.type,
             catalogMode: config.catalogMode,
@@ -102,8 +160,10 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             enabled: config.enabled !== undefined ? config.enabled : true,
             owner: config.owner,
             visibility: config.visibility ?? 'private',
+            sharedWithUserGroups: config.sharedWithUserGroups,
             sharedWithUsers: config.sharedWithUsers,
             enableKeepAlive: config.enableKeepAlive,
+            protocolNegotiation: config.protocolNegotiation,
             keepAliveInterval: config.keepAliveInterval,
             tools: config.tools,
             prompts: config.prompts,
@@ -123,13 +183,6 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
       }
     }
 
-    // Ciphertext is portable between persistence backends; the encryption key stays external.
-    const credentialDao = new CredentialBindingDaoDbImpl();
-    for (const binding of new CredentialBindingDaoImpl().readAll()) {
-      if (!(await credentialDao.get(binding.serverName, binding.username)))
-        await credentialDao.save(binding);
-    }
-
     // Migrate groups
     if (seedServersAndGroups && settings.groups && settings.groups.length > 0) {
       logger.log(`Migrating ${settings.groups.length} groups...`);
@@ -143,6 +196,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             servers: Array.isArray(group.servers) ? group.servers : [],
             owner: group.owner,
             visibility: group.visibility,
+            sharedWithUserGroups: group.sharedWithUserGroups,
             sharedWithUsers: group.sharedWithUsers,
           });
           logger.log(`  - Created group: ${group.name}`);
@@ -156,8 +210,11 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
     if (settings.systemConfig) {
       logger.log('Migrating system configuration...');
       const systemConfig = {
+        dashboardName: settings.systemConfig.dashboardName,
+        toolPolicies: settings.systemConfig.toolPolicies,
         network: settings.systemConfig.network || {},
-        routing: settings.systemConfig.routing || {},
+        // the legacy bearerAuthKey is migrated to a hashed bearer key below
+        routing: { ...settings.systemConfig.routing, bearerAuthKey: '' },
         install: settings.systemConfig.install || {},
         smartRouting: settings.systemConfig.smartRouting || {},
         toolResultCompression: settings.systemConfig.toolResultCompression || {},
@@ -176,18 +233,23 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
     // Migrate bearer auth keys
     logger.log('Migrating bearer authentication keys...');
 
-    // Prefer explicit bearerKeys if present in settings
-    if (Array.isArray(settings.bearerKeys) && settings.bearerKeys.length > 0) {
+    // An existing bearerKeys array (even empty) is authoritative, as in BearerKeyDaoImpl.loadKeysWithMigration()
+    if (Array.isArray(settings.bearerKeys)) {
       for (const key of settings.bearerKeys) {
         await bearerKeyRepo.create({
           name: key.name,
-          token: key.token,
+          // Keys created by a hashing-aware version only carry tokenHash/tokenPrefix
+          ...(key.tokenHash
+            ? { tokenHash: key.tokenHash, tokenPrefix: key.tokenPrefix }
+            : { token: key.token }),
           enabled: key.enabled,
           kind: key.kind ?? 'system',
           owner: key.owner,
           accessType: key.accessType,
           allowedGroups: key.allowedGroups ?? [],
           allowedServers: key.allowedServers ?? [],
+          excludedGroups: key.excludedGroups ?? [],
+          excludedServers: key.excludedServers ?? [],
         } as any);
         logger.log(`  - Migrated bearer key: ${key.name} (${key.id ?? 'no-id'})`);
       }
@@ -327,6 +389,8 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
       }
     }
 
+    scrubSourceFileSecrets();
+
     logger.log('✅ Migration completed successfully');
     return true;
   } catch (error) {
@@ -358,6 +422,9 @@ export async function initializeDatabaseMode(): Promise<boolean> {
 
     const userCount = await userRepo.count();
 
+    if (isReplicaMode() && userCount === 0)
+      throw new Error('Replica database is not seeded; run db:setup before starting replicas');
+
     if (userCount === 0) {
       logger.log('No users found in database, running migration...');
       const migrated = await migrateToDatabase(
@@ -367,7 +434,8 @@ export async function initializeDatabaseMode(): Promise<boolean> {
         throw new Error('Migration failed');
       }
     } else {
-      logger.log(`Database already contains ${userCount} users, skipping migration`);
+      logger.log(`Database already contains ${userCount} users, skipping configuration migration`);
+      await migrateCredentialBindings();
 
       // One-time migration for legacy bearer auth config stored inside DB routing settings.
       // If bearerKeys table already has data, do nothing.
@@ -392,6 +460,7 @@ export async function initializeDatabaseMode(): Promise<boolean> {
             allowedGroups: [],
             allowedServers: [],
           } as any);
+          await systemConfigRepo.updateSection('routing', { ...routing, bearerAuthKey: '' });
           logger.log(
             `  - Migrated legacy DB routing bearer auth config to key: default (enabled=${enableBearerAuth})`,
           );

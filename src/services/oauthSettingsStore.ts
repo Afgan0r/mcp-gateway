@@ -1,6 +1,10 @@
 import { getServerDao } from '../dao/index.js';
 import { ServerConfig } from '../types/index.js';
 import { logger } from '../utils/logger.js';
+import { IsNull } from 'typeorm';
+import { getAppDataSource } from '../db/connection.js';
+import { Server } from '../db/entities/Server.js';
+import { isReplicaMode } from '../utils/replicaMode.js';
 
 type OAuthConfig = NonNullable<ServerConfig['oauth']>;
 export type ServerConfigWithOAuth = ServerConfig & { oauth: OAuthConfig };
@@ -41,6 +45,8 @@ export const mutateOAuthSettings = async (
 
   const { name: _, ...serverConfig } = server;
 
+  const expectedOAuth = server.oauth ? structuredClone(server.oauth) : undefined;
+
   if (!serverConfig.oauth) {
     serverConfig.oauth = {};
   }
@@ -51,6 +57,15 @@ export const mutateOAuthSettings = async (
   };
 
   mutator(context);
+
+  if (isReplicaMode()) {
+    const result = await getAppDataSource().getRepository(Server).createQueryBuilder()
+      .update().set({ oauth: () => ':nextOAuth' })
+      .where({ name: serverName, oauth: expectedOAuth ?? IsNull() })
+      .setParameter('nextOAuth', JSON.stringify(serverConfig.oauth)).execute();
+    if (result.affected !== 1) throw new Error('OAuth configuration changed; retry with current credentials');
+    return context.serverConfig as ServerConfigWithOAuth;
+  }
 
   const updated = await serverDao.update(
     serverName,
@@ -116,12 +131,17 @@ export const persistTokens = async (
   serverName: string,
   tokens: {
     accessToken: string;
+    accessTokenExpiresAt?: number | null;
     refreshToken?: string | null;
     clearPendingAuthorization?: boolean;
   },
 ): Promise<ServerConfigWithOAuth | undefined> => {
   return mutateOAuthSettings(serverName, ({ oauth }) => {
     oauth.accessToken = tokens.accessToken;
+    if (tokens.accessTokenExpiresAt !== undefined) {
+      if (tokens.accessTokenExpiresAt === null) delete oauth.accessTokenExpiresAt;
+      else oauth.accessTokenExpiresAt = tokens.accessTokenExpiresAt;
+    }
 
     if (tokens.refreshToken !== undefined) {
       if (tokens.refreshToken) {
@@ -163,6 +183,7 @@ export const clearOAuthData = async (
   return mutateOAuthSettings(serverName, ({ oauth }) => {
     if (scope === 'tokens' || scope === 'all') {
       delete oauth.accessToken;
+      delete oauth.accessTokenExpiresAt;
       delete oauth.refreshToken;
     }
 

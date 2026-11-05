@@ -29,6 +29,7 @@ export class Group {
     | {
         name: string;
         alias?: string;
+        preserveToolNames?: boolean;
         tools?: string[] | 'all';
         prompts?: string[] | 'all';
         resources?: string[] | 'all';
@@ -41,6 +42,9 @@ export class Group {
 
   @Column({ type: 'varchar', length: 20, nullable: true })
   visibility?: 'private' | 'group' | 'public';
+
+  @Column({ type: 'simple-json', nullable: true })
+  sharedWithUserGroups?: string[];
 
   @Column({ type: 'simple-json', nullable: true })
   sharedWithUsers?: string[];

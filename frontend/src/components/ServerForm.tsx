@@ -1,3 +1,4 @@
+import UserGroupSelection from './UserGroupSelection';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
@@ -5,6 +6,7 @@ import { getServerConfigPermissionError } from '../utils/serverPermissions.js';
 import { X } from 'lucide-react';
 import { Server, EnvVar, ServerFormData, OpenApiToolStats } from '@/types';
 import { apiGet, apiPost } from '../utils/fetchInterceptor';
+import { parseOAuthRelayForm } from '../utils/oauthRelayForm';
 import { buildServerPayload } from '../utils/serverFormPayload';
 import {
   deselectShareUsers,
@@ -103,6 +105,7 @@ const ServerForm = ({
       clientSecret: oauth?.clientSecret || '',
       scopes: oauth?.scopes ? oauth.scopes.join(' ') : '',
       accessToken: oauth?.accessToken || '',
+      accessTokenExpiresAt: oauth?.accessTokenExpiresAt,
       refreshToken: oauth?.refreshToken || '',
       authorizationEndpoint: oauth?.authorizationEndpoint || '',
       tokenEndpoint: oauth?.tokenEndpoint || '',
@@ -115,6 +118,10 @@ const ServerForm = ({
       // and preserved by the backend `normalizeOAuth` whitelist (#1193). Each
       // key is only added when the stored config actually has it, so the
       // payload does not gain absent fields.
+      ...(oauth?.authorizationRelay && { authorizationRelay: oauth.authorizationRelay }),
+      ...(oauth?.authorizationServerMetadata && {
+        authorizationServerMetadata: oauth.authorizationServerMetadata,
+      }),
       ...(oauth?.dynamicRegistration && { dynamicRegistration: oauth.dynamicRegistration }),
       ...(oauth?.revocationEndpoint && { revocationEndpoint: oauth.revocationEndpoint }),
       ...(oauth?.redirectUri && { redirectUri: oauth.redirectUri }),
@@ -138,6 +145,7 @@ const ServerForm = ({
     passthroughHeaders: initialData?.config?.passthroughHeaders?.join(', ') || '',
     visibility: (initialData?.config?.visibility ?? 'private') as 'private' | 'group' | 'public',
     sharedWithUsers: initialData?.config?.sharedWithUsers || [],
+    sharedWithUserGroups: initialData?.config?.sharedWithUserGroups || [],
     options: {
       maxBufferSize: initialData?.config?.options?.maxBufferSize,
       timeout:
@@ -162,6 +170,7 @@ const ServerForm = ({
     },
     // Per-session client isolation initialization
     perSessionClient: initialData?.config?.perSessionClient === true,
+    protocolNegotiation: initialData?.config?.protocolNegotiation,
     credentialTemplate: initialData?.config?.credentialTemplate || [],
     // Proxychains proxy config: round-trip the stored value so editing the
     // server does not silently drop it (there is no in-form editor for it).
@@ -233,6 +242,7 @@ const ServerForm = ({
   });
 
   const [shareCandidates, setShareCandidates] = useState<string[]>([]);
+  const [shareUserGroups, setShareUserGroups] = useState<string[]>([]);
   const [shareCandidatesLoading, setShareCandidatesLoading] = useState(false);
   const [shareCandidatesError, setShareCandidatesError] = useState(false);
   const [shareUserSearch, setShareUserSearch] = useState('');
@@ -248,7 +258,7 @@ const ServerForm = ({
     setShareCandidatesLoading(true);
     setShareCandidatesError(false);
 
-    void apiGet<{ success: boolean; data?: string[] }>(
+    void apiGet<{ success: boolean; data?: string[]; userGroups?: string[] }>(
       `/servers/${encodeURIComponent(shareCandidatesServer)}/share-candidates`,
     )
       .then((response) => {
@@ -256,6 +266,7 @@ const ServerForm = ({
 
         if (response.success && Array.isArray(response.data)) {
           setShareCandidates(response.data);
+          setShareUserGroups(response.userGroups || []);
         } else {
           setShareCandidatesError(true);
         }
@@ -351,6 +362,14 @@ const ServerForm = ({
 
   const [isRequestOptionsExpanded, setIsRequestOptionsExpanded] = useState<boolean>(false);
   const [isOAuthSectionExpanded, setIsOAuthSectionExpanded] = useState<boolean>(false);
+  const [relayOrigins, setRelayOrigins] = useState(
+    initialData?.config?.oauth?.authorizationRelay?.allowedRedirectOrigins.join('\n') || '',
+  );
+  const [relayMetadata, setRelayMetadata] = useState(
+    initialData?.config?.oauth?.authorizationServerMetadata
+      ? JSON.stringify(initialData.config.oauth!.authorizationServerMetadata, null, 2)
+      : '',
+  );
   const [isKeepAliveSectionExpanded, setIsKeepAliveSectionExpanded] = useState<boolean>(false);
   const [isAdvancedExpanded, setIsAdvancedExpanded] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -576,7 +595,12 @@ const ServerForm = ({
 
     try {
       const payload = buildServerPayload({
-        formData,
+        formData: formData.oauth?.authorizationRelay
+          ? {
+              ...formData,
+              oauth: { ...formData.oauth, ...parseOAuthRelayForm(relayOrigins, relayMetadata) },
+            }
+          : formData,
         serverType,
         envVars,
         headerVars,
@@ -590,7 +614,11 @@ const ServerForm = ({
 
       onSubmit(payload);
     } catch (err) {
-      setError(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setError(
+        err instanceof Error && err.message.startsWith('server.oauth.relay')
+          ? t(err.message)
+          : `Error: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   };
 
@@ -604,7 +632,9 @@ const ServerForm = ({
       </div>
 
       {(error || formError) && (
-        <div className="bg-red-50 text-red-700 p-3 rounded mb-4">{formError || error}</div>
+        <div role="alert" className="bg-red-50 text-red-700 p-3 rounded mb-4">
+          {formError || error}
+        </div>
       )}
 
       <form onSubmit={handleSubmit}>
@@ -635,7 +665,6 @@ const ServerForm = ({
                 title={t('server.nameInvalid')}
                 required
               />
-              <p className="text-xs text-[var(--hub-ink-3)] mt-1">{t('server.nameInvalid')}</p>
             </div>
 
             <div className="md:col-span-2">
@@ -1769,6 +1798,11 @@ const ServerForm = ({
                     {t('credentials.argsHint', { placeholder: '{{args.API_KEY}}' })}
                   </p>
                 )}
+                {(serverType === 'sse' || serverType === 'streamable-http') && (
+                  <p className="text-sm text-gray-500">
+                    {t('credentials.urlHint', { placeholder: '{{url.region}}' })}
+                  </p>
+                )}
                 {(formData.credentialTemplate || []).map((slot, index) => (
                   <div key={index} className="flex flex-wrap items-center gap-2">
                     {serverType === 'stdio' ? (
@@ -1791,7 +1825,30 @@ const ServerForm = ({
                         <option value="args">{t('server.arguments')}</option>
                       </select>
                     ) : (
-                      <span className="text-sm">{t('server.headers')}</span>
+                      <select
+                        aria-label={t('credentials.target')}
+                        value={slot.target === 'url' ? 'url' : 'headers'}
+                        className="py-2 px-3 form-input"
+                        onChange={(event) =>
+                          setFormData({
+                            ...formData,
+                            credentialTemplate: formData.credentialTemplate?.map((item, i) =>
+                              i === index
+                                ? {
+                                    ...item,
+                                    target: event.target.value as 'headers' | 'url',
+                                    allowed: event.target.value === 'url' ? [] : undefined,
+                                  }
+                                : item,
+                            ),
+                          })
+                        }
+                      >
+                        <option value="headers">{t('server.headers')}</option>
+                        {(serverType === 'sse' || serverType === 'streamable-http') && (
+                          <option value="url">URL</option>
+                        )}
+                      </select>
                     )}
                     <input
                       required
@@ -1824,6 +1881,25 @@ const ServerForm = ({
                         })
                       }
                     />
+                    {slot.target === 'url' && (
+                      <textarea
+                        required
+                        aria-label={t('credentials.allowed')}
+                        placeholder={t('credentials.allowed')}
+                        value={(slot.allowed || []).join('\n')}
+                        className="w-full py-2 px-3 form-input"
+                        onChange={(event) =>
+                          setFormData({
+                            ...formData,
+                            credentialTemplate: formData.credentialTemplate?.map((item, i) =>
+                              i === index
+                                ? { ...item, allowed: event.target.value.split('\n') }
+                                : item,
+                            ),
+                          })
+                        }
+                      />
+                    )}
                     <button
                       type="button"
                       aria-label={t('credentials.removeSlot')}
@@ -1897,6 +1973,16 @@ const ServerForm = ({
 
                 {formData.visibility === 'group' && (
                   <div className="mt-4 rounded border border-gray-200 dark:border-gray-700 p-3">
+                    <UserGroupSelection
+                      options={shareUserGroups}
+                      selected={formData.sharedWithUserGroups || []}
+                      disabled={
+                        shareCandidatesLoading || shareCandidatesError || !initialData?.name
+                      }
+                      onChange={(sharedWithUserGroups) =>
+                        setFormData((previous) => ({ ...previous, sharedWithUserGroups }))
+                      }
+                    />
                     <div className="text-sm font-medium text-[var(--hub-ink-2)]">
                       {t('server.shareWithUsers', 'Share with users')}
                     </div>
@@ -2063,19 +2149,24 @@ const ServerForm = ({
                       </p>
                       {(serverType === 'sse' || serverType === 'streamable-http') && (
                         <div className="mb-3">
-                          <label htmlFor="oauthIdentityMode" className="block text-xs text-gray-600 mb-1">
+                          <label
+                            htmlFor="oauthIdentityMode"
+                            className="block text-xs text-gray-600 mb-1"
+                          >
                             {t('server.oauth.identityMode')}
                           </label>
                           <select
                             id="oauthIdentityMode"
                             className="w-full py-2 px-3 form-input"
                             value={formData.oauth?.identityMode || 'shared'}
-                            onChange={(e) =>
+                            onChange={(e) => {
                               handleOAuthChange(
                                 'identityMode',
                                 e.target.value as 'shared' | 'personal',
-                              )
-                            }
+                              );
+                              if (e.target.value !== 'personal')
+                                handleOAuthChange('authorizationRelay', undefined);
+                            }}
                           >
                             <option value="shared">{t('server.oauth.sharedIdentity')}</option>
                             <option value="personal">{t('server.oauth.personalIdentity')}</option>
@@ -2103,6 +2194,82 @@ const ServerForm = ({
                               {t('server.oauth.allowInsecureTokenEndpointHelp')}
                             </p>
                           </div>
+                        )}
+                      {(serverType === 'sse' || serverType === 'streamable-http') &&
+                        formData.oauth?.identityMode === 'personal' &&
+                        (auth.user?.isAdmin || formData.oauth.authorizationRelay) && (
+                          <details className="mb-4 rounded border border-gray-200 dark:border-gray-700 p-3">
+                            <summary className="cursor-pointer text-sm font-medium">
+                              {t('server.oauth.advancedSettings')}
+                            </summary>
+                            <div className="mt-3 space-y-3">
+                              <label className="flex items-center gap-2 text-sm">
+                                <input
+                                  type="checkbox"
+                                  id="oauthAuthorizationRelay"
+                                  checked={Boolean(formData.oauth.authorizationRelay)}
+                                  disabled={!auth.user?.isAdmin}
+                                  onChange={(e) =>
+                                    handleOAuthChange(
+                                      'authorizationRelay',
+                                      e.target.checked ? { allowedRedirectOrigins: [] } : undefined,
+                                    )
+                                  }
+                                />
+                                {t('server.oauth.relayEnabled')}
+                              </label>
+                              <p className="text-xs text-gray-500">{t('server.oauth.relayHelp')}</p>
+                              {formData.oauth.authorizationRelay && (
+                                <>
+                                  <div>
+                                    <label
+                                      htmlFor="oauthRelayOrigins"
+                                      className="block text-xs mb-1"
+                                    >
+                                      {t('server.oauth.relayOrigins')}
+                                    </label>
+                                    <textarea
+                                      id="oauthRelayOrigins"
+                                      rows={2}
+                                      required
+                                      disabled={!auth.user?.isAdmin}
+                                      value={relayOrigins}
+                                      onChange={(e) => setRelayOrigins(e.target.value)}
+                                      placeholder="https://login.microsoftonline.com"
+                                      className="w-full py-2 px-3 form-input font-mono text-xs"
+                                    />
+                                    <p className="text-xs text-gray-500 mt-1">
+                                      {t('server.oauth.relayOriginsHelp')}
+                                    </p>
+                                  </div>
+                                  <div>
+                                    <label
+                                      htmlFor="oauthRelayMetadata"
+                                      className="block text-xs mb-1"
+                                    >
+                                      {t('server.oauth.relayMetadata')}
+                                    </label>
+                                    <textarea
+                                      id="oauthRelayMetadata"
+                                      rows={8}
+                                      wrap="off"
+                                      required
+                                      disabled={!auth.user?.isAdmin}
+                                      value={relayMetadata}
+                                      onChange={(e) => setRelayMetadata(e.target.value)}
+                                      placeholder={
+                                        '{\n  "issuer": "http://broker.internal:3000",\n  "authorization_endpoint": "http://broker.internal:3000/authorize",\n  "token_endpoint": "http://broker.internal:3000/token",\n  "response_types_supported": ["code"]\n}'
+                                      }
+                                      className="w-full py-2 px-3 form-input font-mono text-xs"
+                                    />
+                                    <p className="text-xs text-gray-500 mt-1">
+                                      {t('server.oauth.relayMetadataHelp')}
+                                    </p>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          </details>
                         )}
                       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                         <div>
@@ -2291,13 +2458,13 @@ const ServerForm = ({
                           className="mr-2"
                         />
                         <label htmlFor="enableKeepAlive" className="text-gray-600 text-sm">
-                          {t('server.enableKeepAlive', 'Enable Health Checks and Auto Reconnect')}
+                          {t('server.enableKeepAlive', 'Enable Health Checks')}
                         </label>
                       </div>
                       <p className="text-xs text-gray-500 mb-3">
                         {t(
                           'server.keepAliveDescription',
-                          'Run periodic health checks and automatically reconnect this remote server when it becomes disconnected.',
+                          'Run periodic health checks. Disconnected remote servers always reconnect automatically with backoff.',
                         )}
                       </p>
                       <div>
@@ -2328,7 +2495,7 @@ const ServerForm = ({
                         <p className="text-xs text-gray-500 mt-1">
                           {t(
                             'server.keepAliveIntervalDescription',
-                            'Time between health checks and automatic reconnect attempts in milliseconds (default: 60000ms = 1 minute)',
+                            'Time between health checks in milliseconds (default: 60000ms = 1 minute)',
                           )}
                         </p>
                       </div>

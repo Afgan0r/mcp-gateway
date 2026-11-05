@@ -10,6 +10,10 @@
  */
 
 import * as client from 'openid-client';
+import { withReplicaLock } from './replicaLock.js';
+import { isReplicaMode } from '../utils/replicaMode.js';
+import { loadServerConfig } from './oauthSettingsStore.js';
+import { expandServerConfig } from './serverConfigEnvironment.js';
 import { getSystemConfigDao, getUserDao } from '../dao/index.js';
 import { ServerConfig } from '../types/index.js';
 import { resolveInstallBaseUrl } from '../utils/installBaseUrl.js';
@@ -471,6 +475,8 @@ export const exchangeCodeForToken = async (
     await persistTokens(serverName, {
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token ?? undefined,
+      accessTokenExpiresAt:
+        tokens.expires_in === undefined ? null : Date.now() + tokens.expires_in * 1000,
     });
 
     return {
@@ -487,7 +493,7 @@ export const exchangeCodeForToken = async (
 /**
  * Refresh access token using refresh token
  */
-export const refreshAccessToken = async (
+const refreshAccessTokenUnlocked = async (
   serverName: string,
   serverConfig: ServerConfig,
   clientInfo: RegisteredClientInfo,
@@ -511,6 +517,8 @@ export const refreshAccessToken = async (
     await persistTokens(serverName, {
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token ?? undefined,
+      accessTokenExpiresAt:
+        tokens.expires_in === undefined ? null : Date.now() + tokens.expires_in * 1000,
     });
 
     return {
@@ -523,6 +531,25 @@ export const refreshAccessToken = async (
     throw error;
   }
 };
+
+export const refreshAccessToken = (
+  serverName: string,
+  serverConfig: ServerConfig,
+  clientInfo: RegisteredClientInfo,
+  refreshToken: string,
+): Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number }> =>
+  withReplicaLock(JSON.stringify(['oauth', serverName, 'shared']), async () => {
+    if (isReplicaMode()) {
+      const latest = await loadServerConfig(serverName);
+      if (!latest) throw new Error('Server no longer exists');
+      const oauth = (await expandServerConfig(latest)).oauth;
+      if (oauth?.refreshToken !== refreshToken) {
+        if (!oauth?.accessToken) throw new Error('OAuth credentials changed; reconnect');
+        return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken };
+      }
+    }
+    return refreshAccessTokenUnlocked(serverName, serverConfig, clientInfo, refreshToken);
+  });
 
 /**
  * Generate PKCE code verifier
@@ -589,7 +616,8 @@ export const initializeOAuthForServer = async (
   autoDetectedIssuer?: string,
   autoDetectedScopes?: string[],
 ): Promise<RegisteredClientInfo | null> => {
-  if (!serverConfig.oauth) {
+  // Explicit metadata is consumed by the SDK provider, including registration.
+  if (!serverConfig.oauth || serverConfig.oauth.authorizationServerMetadata) {
     return null;
   }
 

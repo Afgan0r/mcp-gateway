@@ -4,6 +4,7 @@ import LanguageDetector from 'i18next-browser-languagedetector';
 
 // Import shared translations from root locales directory
 import enTranslation from '../../locales/en.json';
+import viTranslation from '../../locales/vi.json';
 import zhTranslation from '../../locales/zh.json';
 import frTranslation from '../../locales/fr.json';
 import trTranslation from '../../locales/tr.json';
@@ -19,6 +20,9 @@ i18n
     resources: {
       en: {
         translation: enTranslation,
+      },
+      vi: {
+        translation: viTranslation,
       },
       zh: {
         translation: zhTranslation,
@@ -45,7 +49,7 @@ i18n
 
     detection: {
       // Order of detection; prioritize localStorage to respect user language choice
-      order: ['localStorage', 'cookie', 'htmlTag', 'navigator'],
+      order: ['localStorage', 'cookie', 'navigator', 'htmlTag'],
       // Cache the language in localStorage
       caches: ['localStorage', 'cookie'],
     },

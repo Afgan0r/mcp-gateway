@@ -119,10 +119,14 @@ describe('system configuration authorization', () => {
       .put('/api/system-config')
       .set('x-auth-token', createUserToken('regular-user', false))
       .send({
+        toolPolicies: [],
         routing: {
           skipAuth: true,
         },
-        network: { allowedCidrs: ['0.0.0.0/0'] },
+        network: {
+          allowedCidrs: ['0.0.0.0/0'],
+          fakeIpExceptions: [{ serverId: 'trusted', hostname: 'mcp.example.com' }],
+        },
       });
 
     expect(response.status).toBe(403);

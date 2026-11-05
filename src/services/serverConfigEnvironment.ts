@@ -60,7 +60,8 @@ export const getServerEnvironment = async (
 };
 
 export const expandServerConfig = async <T extends ServerConfig>(config: T): Promise<T> => {
-  const { owner, visibility, sharedWithUsers, env, ...transportConfig } = config;
+  const { owner, visibility, sharedWithUsers, sharedWithUserGroups, env, ...transportConfig } =
+    config;
   const expansion = await getExpansionEnvironment(config);
   const resolvedEnv = env
     ? hasCredentialTemplate(config) || expandedEnvironments.has(env)
@@ -75,5 +76,6 @@ export const expandServerConfig = async <T extends ServerConfig>(config: T): Pro
     owner,
     visibility,
     sharedWithUsers,
+    sharedWithUserGroups,
   } as T;
 };

@@ -28,7 +28,9 @@ export class ServerRepository {
   /**
    * Create a new server
    */
-  async create(server: Omit<Server, 'id' | 'createdAt' | 'updatedAt'>): Promise<Server> {
+  async create(
+    server: Omit<Server, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
+  ): Promise<Server> {
     assertSmartRoutingNameAvailable(server.name);
     const newServer = this.repository.create(server);
     return await this.repository.save(newServer);
@@ -125,6 +127,10 @@ export class ServerRepository {
       .orWhere('server.visibility = :visibility', { visibility: 'public' })
       .orWhere(
         'server.visibility = :sharedVisibility AND :username = ANY(COALESCE(server.sharedWithUsers, ARRAY[]::text[]))',
+        { sharedVisibility: 'group', username },
+      )
+      .orWhere(
+        `server.visibility = :sharedVisibility AND EXISTS (SELECT 1 FROM users u WHERE u.username = :username AND COALESCE(u."userGroups", ARRAY[]::text[]) && COALESCE(server."sharedWithUserGroups", ARRAY[]::text[]))`,
         { sharedVisibility: 'group', username },
       )
       .orderBy('server.enabled', 'DESC')

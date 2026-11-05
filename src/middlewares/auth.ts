@@ -5,7 +5,7 @@ import { getBearerKeyDao, getSystemConfigDao } from '../dao/index.js';
 import { BearerKey, SystemConfig } from '../types/index.js';
 import { getBetterAuthRuntimeConfig } from '../services/betterAuthConfig.js';
 import { authenticateForwardAuthToken } from '../services/forwardAuthService.js';
-import { safeCompare } from '../utils/safeCompare.js';
+import { bearerKeyMatches } from '../utils/bearerKeyToken.js';
 import { getBearerTokenFromHeaders } from '../utils/bearerAuth.js';
 import { logger } from '../utils/logger.js';
 
@@ -46,7 +46,7 @@ const validateBearerAuth = async (
   }
 
   const matchingKey: BearerKey | undefined = enabledKeys.find((key) =>
-    safeCompare(key.token, token),
+    bearerKeyMatches(key, token),
   );
   if (!matchingKey) {
     logger.warn('Bearer auth failed: token did not match any configured bearer key');
@@ -132,6 +132,7 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
     (req as any).user = {
       username: forwardAuthResult.user.username,
       isAdmin: forwardAuthResult.user.isAdmin || false,
+      userGroups: forwardAuthResult.user.userGroups,
     };
     (req as any).forwardAuthUser = forwardAuthResult.user;
     next();
@@ -165,6 +166,7 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
       (req as any).user = {
         username: betterAuthUser.username,
         isAdmin: betterAuthUser.isAdmin || false,
+        userGroups: betterAuthUser.userGroups,
       };
       next();
       return;
@@ -195,7 +197,11 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
       res.status(401).json({ success: false, message: 'Token is not valid' });
       return;
     }
-    (req as any).user = { username: user.username, isAdmin: user.isAdmin || false };
+    (req as any).user = {
+      username: user.username,
+      isAdmin: user.isAdmin || false,
+      userGroups: user.userGroups,
+    };
     next();
   } catch (error) {
     res.status(401).json({ success: false, message: 'Token is not valid' });
